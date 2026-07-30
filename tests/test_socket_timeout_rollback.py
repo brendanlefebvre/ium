@@ -11,52 +11,10 @@ traceback showed it (``http.client.begin`` -> ``_read_status`` -> socket recv).
 
 import json
 import pytest
-from unittest.mock import patch
 
 from docker_api import DockerAPIError, DockerClient
 from ium import DockerImageUpdater
-
-
-# ---------------------------------------------------------------------------
-# Fake Docker socket
-# ---------------------------------------------------------------------------
-
-class _FakeResponse:
-    def __init__(self, status: int, body: bytes = b""):
-        self.status = status
-        self._body = body
-
-    def read(self) -> bytes:
-        return self._body
-
-
-class _FakeConn:
-    """Stands in for UnixHTTPConnection, driven by a handler callable."""
-
-    def __init__(self, handler, calls):
-        self._handler = handler
-        self._calls = calls
-        self._pending = None
-
-    def request(self, method, url, body=None, headers=None):
-        self._pending = (method, url, body)
-        self._calls.append((method, url))
-
-    def getresponse(self):
-        return self._handler(*self._pending)
-
-    def close(self):
-        pass
-
-
-def fake_socket(handler):
-    """Patch DockerClient's transport.  Returns (patcher, calls list)."""
-    calls: list[tuple[str, str]] = []
-    patcher = patch(
-        "docker_api.UnixHTTPConnection",
-        lambda socket_path, timeout=30: _FakeConn(handler, calls),
-    )
-    return patcher, calls
+from tests.fake_docker import FakeResponse, fake_socket
 
 
 CONTAINER_INFO = {
@@ -148,12 +106,12 @@ class TestRollbackOnSocketTimeout:
     def _handler_timing_out_on(self, target_fragment):
         def handler(method, url, body):
             if method == "GET" and "/containers/sonarr/json" in url:
-                return _FakeResponse(200, json.dumps(CONTAINER_INFO).encode())
+                return FakeResponse(200, json.dumps(CONTAINER_INFO).encode())
             if target_fragment in url:
                 raise TimeoutError("timed out")
             if method == "POST" and "/containers/create" in url:
-                return _FakeResponse(201, json.dumps({"Id": "new123"}).encode())
-            return _FakeResponse(204)
+                return FakeResponse(201, json.dumps({"Id": "new123"}).encode())
+            return FakeResponse(204)
         return handler
 
     def test_create_timeout_restores_old_container(self, updater):
@@ -205,15 +163,15 @@ class TestUpdateLoopSurvivesTimeout:
     def test_second_container_still_updated_after_first_times_out(self, updater):
         def handler(method, url, body):
             if method == "GET" and "/containers/sonarr-hd/json" in url:
-                return _FakeResponse(200, json.dumps(CONTAINER_INFO).encode())
+                return FakeResponse(200, json.dumps(CONTAINER_INFO).encode())
             if method == "GET" and "/containers/sonarr-4k/json" in url:
-                return _FakeResponse(200, json.dumps(CONTAINER_INFO).encode())
+                return FakeResponse(200, json.dumps(CONTAINER_INFO).encode())
             # Only the first container's create times out.
             if "/containers/create" in url and "name=sonarr-hd" in url:
                 raise TimeoutError("timed out")
             if method == "POST" and "/containers/create" in url:
-                return _FakeResponse(201, json.dumps({"Id": "new123"}).encode())
-            return _FakeResponse(204)
+                return FakeResponse(201, json.dumps({"Id": "new123"}).encode())
+            return FakeResponse(204)
 
         patcher, calls = fake_socket(handler)
         with patcher:

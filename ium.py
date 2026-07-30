@@ -59,7 +59,8 @@ DEFAULT_BASE_TAG = "latest"
 # the old 40 s stop budget and left the container down (2026-07-29 incident).
 DEFAULT_STOP_TIMEOUT = 10
 DEFAULT_REQUEST_TIMEOUT = 60
-REQUEST_TIMEOUT = 30
+# Registry (HTTPS) request timeout — unrelated to the Docker socket budget above.
+REGISTRY_REQUEST_TIMEOUT = 30
 MANIFEST_ACCEPT_HEADER = (
     "application/vnd.docker.distribution.manifest.list.v2+json,"
     "application/vnd.docker.distribution.manifest.v2+json,"
@@ -329,7 +330,7 @@ class DockerImageUpdater:
         """HTTP request with retry on transient failures (connection errors, 5xx)."""
         max_retries = 3
         backoff = 2
-        kwargs.setdefault('timeout', REQUEST_TIMEOUT)
+        kwargs.setdefault('timeout', REGISTRY_REQUEST_TIMEOUT)
         last_exception: Optional[Exception] = None
         for attempt in range(max_retries + 1):
             try:
