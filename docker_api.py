@@ -121,6 +121,8 @@ class DockerClient:
                 return None
 
             return json.loads(raw)
+        except (TimeoutError, OSError) as e:
+            raise DockerAPIError(500, f"Socket error: {e}") from e
         finally:
             conn.close()
 
