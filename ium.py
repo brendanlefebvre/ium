@@ -7,7 +7,7 @@ This script monitors Docker images for updates by comparing a base tag
 tags that match user-defined regex patterns.
 """
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 import json
 import re
@@ -51,7 +51,22 @@ DEFAULT_REGISTRY = "registry-1.docker.io"
 DEFAULT_AUTH_URL = "https://auth.docker.io/token"
 DEFAULT_NAMESPACE = "library"
 DEFAULT_BASE_TAG = "latest"
-REQUEST_TIMEOUT = 30
+
+# Container-update timeouts, overridable per image in config.json.
+# DEFAULT_STOP_TIMEOUT is Docker's SIGTERM grace period; DEFAULT_REQUEST_TIMEOUT
+# is the socket read budget for lifecycle calls.  60 s rather than the 30 s
+# http.client default: stopping a large container on NAS-grade storage overran
+# the old 40 s stop budget and left the container down (2026-07-29 incident).
+DEFAULT_STOP_TIMEOUT = 10
+DEFAULT_REQUEST_TIMEOUT = 60
+
+# Registry (HTTPS) request timeout — unrelated to the Docker socket budget above.
+REGISTRY_REQUEST_TIMEOUT = 30
+
+# Container states that mean "not running", so an update may safely continue
+# after a stop request failed.  'paused' is deliberately excluded: a paused
+# container still holds its processes.
+STOPPED_STATUSES = frozenset({'exited', 'created', 'dead'})
 MANIFEST_ACCEPT_HEADER = (
     "application/vnd.docker.distribution.manifest.list.v2+json,"
     "application/vnd.docker.distribution.manifest.v2+json,"
@@ -99,7 +114,9 @@ CONFIG_SCHEMA = {
                     "auto_update": {"type": "boolean"},
                     "registry": {"type": "string"},
                     "cleanup_old_images": {"type": "boolean"},
-                    "keep_versions": {"type": "integer", "minimum": 1}
+                    "keep_versions": {"type": "integer", "minimum": 1},
+                    "stop_timeout": {"type": "integer", "minimum": 1},
+                    "request_timeout": {"type": "integer", "minimum": 1}
                 },
                 "required": ["image", "regex"]
             }
@@ -319,7 +336,7 @@ class DockerImageUpdater:
         """HTTP request with retry on transient failures (connection errors, 5xx)."""
         max_retries = 3
         backoff = 2
-        kwargs.setdefault('timeout', REQUEST_TIMEOUT)
+        kwargs.setdefault('timeout', REGISTRY_REQUEST_TIMEOUT)
         last_exception: Optional[Exception] = None
         for attempt in range(max_retries + 1):
             try:
@@ -919,6 +936,24 @@ class DockerImageUpdater:
             )
             return None
 
+    def _container_exists(self, container_name: str) -> Optional[bool]:
+        """Whether a container exists, as far as the daemon will say.
+
+        Returns True/False when the daemon answers, and None when it could not
+        be reached — an unreachable daemon must not be mistaken for a 404, since
+        callers use this to decide whether a half-applied operation landed.
+        """
+        try:
+            self.docker.inspect_container(container_name)
+            return True
+        except DockerAPIError as e:
+            if e.status == 404:
+                return False
+            self.logger.warning(
+                f"Could not determine whether '{container_name}' exists: {e.message}"
+            )
+            return None
+
     def _get_containers_for_image(self, image: str) -> List[Dict[str, str]]:
         """Get all containers (running or stopped) using a specific image.
 
@@ -1065,7 +1100,9 @@ class DockerImageUpdater:
             return None
 
     def _update_container(self, container_name: str, image: str, tag: str,
-                          registry: Optional[str] = None) -> bool:
+                          registry: Optional[str] = None,
+                          stop_timeout: int = DEFAULT_STOP_TIMEOUT,
+                          request_timeout: int = DEFAULT_REQUEST_TIMEOUT) -> bool:
         """
         Update a running container with a new image.
 
@@ -1074,6 +1111,8 @@ class DockerImageUpdater:
             image: Image name
             tag: Tag to use
             registry: Optional registry override (e.g. 'ghcr.io')
+            stop_timeout: SIGTERM grace period passed to Docker when stopping
+            request_timeout: Socket read budget for the Docker lifecycle calls
 
         Returns:
             True if successful, False otherwise
@@ -1099,7 +1138,27 @@ class DockerImageUpdater:
         # Skip if already running the target image (e.g. retry after partial failure)
         current_image = container_info.get('Config', {}).get('Image', '')
         if current_image == full_image:
-            self.logger.info(f"Container {container_name} already running {full_image}, skipping")
+            status = (container_info.get('State') or {}).get('Status', '')
+            if status == 'running':
+                self.logger.info(f"Container {container_name} already running {full_image}, skipping")
+                return True
+
+            # On the target image but not running: a previous update was
+            # interrupted after create_container (e.g. its response timed out).
+            # Reporting success here would leave the container down forever,
+            # since every later cycle takes this same short-circuit.  Starting
+            # is idempotent — Docker answers 304 if it is already up.
+            self.logger.warning(
+                f"Container {container_name} is on {full_image} but status is "
+                f"'{status or 'unknown'}' — starting it (interrupted update)"
+            )
+            try:
+                self.docker.start_container(container_name, timeout=request_timeout)
+            except DockerAPIError as e:
+                self.logger.error(
+                    f"Could not start {container_name}: {e.message}"
+                )
+                return False
             return True
 
         try:
@@ -1110,30 +1169,98 @@ class DockerImageUpdater:
 
             # Stop the container
             self.logger.info(f"Stopping container {container_name}...")
-            self.docker.stop_container(container_name)
+            try:
+                self.docker.stop_container(container_name, timeout=stop_timeout,
+                                          request_timeout=request_timeout)
+            except DockerAPIError as stop_err:
+                # A failed stop request does not prove the stop did not happen.
+                # The daemon can finish stopping a heavy container after our
+                # socket budget expires, which is exactly what stranded a
+                # container on 2026-07-29.  Inspect before giving up.
+                post_stop = self._get_container_config(container_name)
+                status = ((post_stop or {}).get('State') or {}).get('Status', '')
+                if status in STOPPED_STATUSES:
+                    self.logger.warning(
+                        f"Stop request for {container_name} failed "
+                        f"({stop_err.message}) but the container is '{status}' "
+                        f"— continuing with the update"
+                    )
+                else:
+                    detail = f"still '{status}'" if status else "state unknown"
+                    self.logger.error(
+                        f"Could not stop {container_name} ({stop_err.message}); "
+                        f"{detail} — aborting update to avoid renaming a live "
+                        f"container"
+                    )
+                    return False
 
             # Rename old container as backup
             backup_name = f"{container_name}_backup_{int(time.time())}"
             self.logger.info(f"Renaming old container to {backup_name}")
-            self.docker.rename_container(container_name, backup_name)
+            try:
+                self.docker.rename_container(container_name, backup_name,
+                                            timeout=request_timeout)
+            except DockerAPIError as rename_err:
+                # The most dangerous call in the update to lose the answer to:
+                # the container is already stopped, and its identity is now
+                # ambiguous.  Creating a replacement blindly could collide with
+                # a container still holding the name, while aborting blindly
+                # could abandon it under the backup name forever.  Ask both.
+                renamed = self._container_exists(backup_name)
+                original = self._container_exists(container_name)
+
+                if renamed is True and original is False:
+                    self.logger.warning(
+                        f"Rename request failed ({rename_err.message}) but "
+                        f"{container_name} is now {backup_name} — continuing "
+                        f"with the update"
+                    )
+                elif original is True:
+                    self.logger.error(
+                        f"Could not rename {container_name} "
+                        f"({rename_err.message}); restarting it and aborting "
+                        f"the update"
+                    )
+                    try:
+                        self.docker.start_container(container_name,
+                                                   timeout=request_timeout)
+                    except DockerAPIError as restart_err:
+                        self.logger.error(
+                            f"Could not restart {container_name} after the "
+                            f"failed rename: {restart_err.message} — start it "
+                            f"manually"
+                        )
+                    return False
+                else:
+                    self.logger.error(
+                        f"Could not rename {container_name} "
+                        f"({rename_err.message}) and cannot determine whether "
+                        f"the rename was applied — aborting without creating a "
+                        f"replacement; check for {backup_name} manually"
+                    )
+                    return False
 
             # Create and start new container
             self.logger.info(f"Creating new container {container_name}...")
             try:
-                container_id = self.docker.create_container(container_name, create_config)
-                self.docker.start_container(container_id)
+                container_id = self.docker.create_container(
+                    container_name, create_config, timeout=request_timeout)
+                self.docker.start_container(container_id, timeout=request_timeout)
 
                 # Connect to additional networks
                 for network in extra_networks:
-                    self.docker.connect_network(network, container_id)
+                    self.docker.connect_network(network, container_id,
+                                                timeout=request_timeout)
 
             except DockerAPIError as e:
                 # Rollback on failure
                 self.logger.error(f"Failed to create new container: {e.message}")
                 self.logger.info("Rolling back...")
                 try:
-                    self.docker.rename_container(backup_name, container_name)
-                    self.docker.start_container(container_name)
+                    self.docker.rename_container(backup_name, container_name,
+                                                timeout=request_timeout)
+                    self.docker.start_container(container_name,
+                                               timeout=request_timeout)
                 except DockerAPIError as rb_err:
                     # Rename failed — the new container likely took the name already
                     # (e.g. it was created and started before an extra-network connect
@@ -1166,7 +1293,9 @@ class DockerImageUpdater:
             return False
 
     def _update_containers(self, container_names: List[str], image: str, tag: str,
-                           registry: Optional[str] = None) -> Dict[str, bool]:
+                           registry: Optional[str] = None,
+                           stop_timeout: int = DEFAULT_STOP_TIMEOUT,
+                           request_timeout: int = DEFAULT_REQUEST_TIMEOUT) -> Dict[str, bool]:
         """Update multiple containers to a new image tag.
 
         Args:
@@ -1174,6 +1303,8 @@ class DockerImageUpdater:
             image: Base image name
             tag: Target tag to update to
             registry: Optional registry override (e.g. 'ghcr.io')
+            stop_timeout: SIGTERM grace period passed to Docker when stopping
+            request_timeout: Socket read budget for the Docker lifecycle calls
 
         Returns:
             Dict mapping container_name -> success boolean
@@ -1181,7 +1312,10 @@ class DockerImageUpdater:
         results = {}
         for container_name in container_names:
             self.logger.info(f"Updating container {container_name} to {image}:{tag}")
-            success = self._update_container(container_name, image, tag, registry)
+            success = self._update_container(
+                container_name, image, tag, registry,
+                stop_timeout=stop_timeout, request_timeout=request_timeout,
+            )
             results[container_name] = success
 
         # Log summary
@@ -1434,6 +1568,8 @@ class DockerImageUpdater:
             registry = image_config.get('registry')
             cleanup = image_config.get('cleanup_old_images', False)
             keep_versions = image_config.get('keep_versions', 3)
+            stop_timeout = image_config.get('stop_timeout', DEFAULT_STOP_TIMEOUT)
+            request_timeout = image_config.get('request_timeout', DEFAULT_REQUEST_TIMEOUT)
 
             self.logger.info(f"Checking {image}:{base_tag}...")
 
@@ -1530,7 +1666,11 @@ class DockerImageUpdater:
                                 # Update all discovered containers
                                 container_names = [c['name'] for c in containers]
                                 self.logger.info(f"Found {len(containers)} container(s) using {image}: {', '.join(container_names)}")
-                                update_results = self._update_containers(container_names, image, matching_tag, registry)
+                                update_results = self._update_containers(
+                                    container_names, image, matching_tag, registry,
+                                    stop_timeout=stop_timeout,
+                                    request_timeout=request_timeout,
+                                )
 
                                 # Only mark success if ALL containers updated;
                                 # partial failure leaves state unchanged so the
@@ -1596,7 +1736,11 @@ class DockerImageUpdater:
                             if containers:
                                 container_names = [c['name'] for c in containers]
                                 self.logger.info(f"Found {len(containers)} container(s) using {image}: {', '.join(container_names)}")
-                                update_results = self._update_containers(container_names, image, matching_tag, registry)
+                                update_results = self._update_containers(
+                                    container_names, image, matching_tag, registry,
+                                    stop_timeout=stop_timeout,
+                                    request_timeout=request_timeout,
+                                )
                                 update_ok = any(update_results.values()) if update_results else True
                             else:
                                 self.logger.info(f"No containers found for {image}, image updated only")

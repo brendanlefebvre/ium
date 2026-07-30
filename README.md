@@ -66,12 +66,31 @@ Use the Web UI to add images via **Add from Preset** (19 built-in) or **+ Add Im
     "auto_update": false,
     "cleanup_old_images": true,
     "keep_versions": 3,
-    "registry": "ghcr.io"
+    "registry": "ghcr.io",
+    "stop_timeout": 10,
+    "request_timeout": 60
   }]
 }
 ```
 
 Only `image` and `regex` are required. Containers are auto-detected — no need to specify container names.
+
+### Timeouts
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `stop_timeout` | `10` | Seconds Docker waits after SIGTERM before SIGKILL when stopping the container |
+| `request_timeout` | `60` | Seconds to wait for the Docker daemon to answer a container lifecycle call |
+
+Raise both for containers that are slow to stop, or on slow storage such as a
+NAS. The stop request gets `stop_timeout + request_timeout` seconds in total,
+so the socket cannot expire before the grace period has even elapsed.
+
+If a request does time out, ium never assumes the worst: the daemon often
+completes the operation after the socket gave up. It inspects the container and
+continues the update if it really did stop, restores the previous container if a
+later step failed, and starts a container that a previous run created but never
+started. A container is never left renamed or half-migrated.
 
 ### Common Patterns
 

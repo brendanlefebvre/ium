@@ -15,8 +15,22 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Docker Engine API version — compatible with Docker 20.10+
+# Preferred Docker Engine API version.  Deliberately conservative: 1.41 is the
+# ceiling of Docker 20.10, and every endpoint this client uses exists there.
+# The version actually used is negotiated per daemon (see
+# DockerClient._negotiate_api_version) because Docker 25+ rejects anything below
+# its MinAPIVersion of 1.44, and a hard pin cannot satisfy both ends.
 API_VERSION = "v1.41"
+
+
+def _parse_api_version(value: str) -> tuple:
+    """Parse "1.44" or "v1.44" into (1, 44).  Raises ValueError if malformed."""
+    return tuple(int(part) for part in value.strip().lstrip("vV").split("."))
+
+
+def _format_api_version(parsed: tuple) -> str:
+    """Render (1, 44) back into the "v1.44" form used in request paths."""
+    return "v" + ".".join(str(part) for part in parsed)
 
 
 class DockerAPIError(Exception):
@@ -45,7 +59,8 @@ class UnixHTTPConnection(http.client.HTTPConnection):
 class DockerClient:
     """Client for the Docker Engine API over Unix socket."""
 
-    def __init__(self, socket_path: Optional[str] = None):
+    def __init__(self, socket_path: Optional[str] = None,
+                 api_version: Optional[str] = None):
         if socket_path is None:
             host = os.environ.get("DOCKER_HOST", "")
             if host:
@@ -53,10 +68,69 @@ class DockerClient:
             else:
                 socket_path = "/var/run/docker.sock"
         self._socket_path = socket_path
+        # None means "negotiate on first use"; an explicit value is trusted.
+        self._api_version = api_version
+
+    @property
+    def api_version(self) -> str:
+        """API version to use, negotiated with the daemon on first access."""
+        if self._api_version is None:
+            self._api_version = self._negotiate_api_version()
+        return self._api_version
+
+    def _negotiate_api_version(self) -> str:
+        """Choose an API version this daemon accepts.
+
+        ``GET /version`` is served on the unversioned path by every Engine and
+        reports ApiVersion (newest supported) and MinAPIVersion (oldest).  We
+        prefer API_VERSION, raise it to the daemon's minimum when that is
+        higher, and lower it to the daemon's maximum when that is lower.
+
+        Any failure falls back to API_VERSION: a daemon we cannot probe is
+        better served by an attempt than by an exception.
+        """
+        try:
+            info = self._request("GET", "/version", timeout=10, versioned=False) or {}
+        except DockerAPIError as e:
+            logger.warning(
+                f"Could not probe Docker API version ({e.message}); "
+                f"falling back to {API_VERSION}"
+            )
+            return API_VERSION
+
+        server_max = info.get("ApiVersion") or info.get("APIVersion")
+        server_min = info.get("MinAPIVersion") or info.get("MinApiVersion")
+
+        chosen = _parse_api_version(API_VERSION)
+        try:
+            if server_min:
+                minimum = _parse_api_version(server_min)
+                if minimum > chosen:
+                    chosen = minimum
+            if server_max:
+                maximum = _parse_api_version(server_max)
+                if maximum < chosen:
+                    chosen = maximum
+        except (ValueError, AttributeError):
+            logger.warning(
+                f"Unparseable Docker API version in /version response "
+                f"(ApiVersion={server_max!r}, MinAPIVersion={server_min!r}); "
+                f"falling back to {API_VERSION}"
+            )
+            return API_VERSION
+
+        negotiated = _format_api_version(chosen)
+        if negotiated != API_VERSION:
+            logger.info(
+                f"Negotiated Docker API version {negotiated} "
+                f"(daemon supports {server_min}-{server_max})"
+            )
+        return negotiated
 
     def _request(self, method: str, path: str, body: Any = None,
                  query: Optional[Dict[str, str]] = None,
-                 timeout: int = 30, stream: bool = False) -> Any:
+                 timeout: int = 30, stream: bool = False,
+                 versioned: bool = True) -> Any:
         """Send an HTTP request to the Docker Engine API.
 
         Creates a fresh connection per call (Docker socket is local so
@@ -66,7 +140,9 @@ class DockerClient:
         response body is consumed line-by-line and the last status JSON
         object is returned (used for ``POST /images/create``).
         """
-        url = f"/{API_VERSION}{path}"
+        # versioned=False is used by the negotiation probe itself, which must
+        # not carry a version prefix (and must not recurse into the property).
+        url = f"/{self.api_version}{path}" if versioned else path
         if query:
             url += "?" + urllib.parse.urlencode(query)
 
@@ -121,6 +197,18 @@ class DockerClient:
                 return None
 
             return json.loads(raw)
+        except OSError as e:
+            # Socket-level failure — read timeout, connection refused, EPIPE.
+            # TimeoutError and socket.timeout are both OSError subclasses.
+            #
+            # Surface it as DockerAPIError rather than letting it escape: every
+            # caller already handles DockerAPIError, and _update_container's
+            # rollback depends on it.  A bare OSError slips past those handlers,
+            # which leaves a container stopped and renamed with no rollback.
+            #
+            # Status 0 means "no HTTP response" — the daemon may or may not have
+            # applied the request.
+            raise DockerAPIError(0, f"{method} {url}: {e}") from e
         finally:
             conn.close()
 
@@ -179,31 +267,43 @@ class DockerClient:
         """
         return self._request("GET", f"/containers/{name}/json")
 
-    def stop_container(self, name: str, timeout: int = 10) -> None:
-        """Stop a container."""
+    def stop_container(self, name: str, timeout: int = 10,
+                       request_timeout: Optional[int] = None) -> None:
+        """Stop a container.
+
+        *timeout* is Docker's SIGTERM grace period (the ``t`` parameter).
+        *request_timeout* is the socket read budget allowed on top of it,
+        defaulting to 30 s.  The daemon can take considerably longer than the
+        grace period to answer on slow storage, and a read that expires first
+        leaves the caller unable to tell whether the stop was applied.
+        """
+        slack = 30 if request_timeout is None else request_timeout
         self._request(
             "POST", f"/containers/{name}/stop",
             query={"t": str(timeout)},
-            timeout=timeout + 30,
+            timeout=timeout + slack,
         )
 
-    def rename_container(self, id_or_name: str, new_name: str) -> None:
+    def rename_container(self, id_or_name: str, new_name: str,
+                         timeout: int = 30) -> None:
         """Rename a container."""
         self._request("POST", f"/containers/{id_or_name}/rename",
-                       query={"name": new_name})
+                       query={"name": new_name}, timeout=timeout)
 
-    def create_container(self, name: str, config: Dict[str, Any]) -> str:
+    def create_container(self, name: str, config: Dict[str, Any],
+                         timeout: int = 30) -> str:
         """Create a container.  Returns the new container ID."""
         result = self._request(
             "POST", "/containers/create",
             body=config,
             query={"name": name},
+            timeout=timeout,
         )
         return result["Id"]
 
-    def start_container(self, name: str) -> None:
+    def start_container(self, name: str, timeout: int = 30) -> None:
         """Start an existing container."""
-        self._request("POST", f"/containers/{name}/start")
+        self._request("POST", f"/containers/{name}/start", timeout=timeout)
 
     def remove_container(self, name: str, force: bool = False, timeout: int = 30) -> None:
         """Remove a container."""
@@ -212,9 +312,11 @@ class DockerClient:
 
     # ── Network operations ────────────────────────────────────────
 
-    def connect_network(self, network: str, container_id: str) -> None:
+    def connect_network(self, network: str, container_id: str,
+                        timeout: int = 30) -> None:
         """Connect a container to a network."""
         self._request(
             "POST", f"/networks/{network}/connect",
             body={"Container": container_id},
+            timeout=timeout,
         )

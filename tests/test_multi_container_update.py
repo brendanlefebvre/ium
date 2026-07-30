@@ -3,7 +3,7 @@
 import json
 import pytest
 from unittest.mock import Mock, patch, call
-from ium import DockerImageUpdater
+from ium import DEFAULT_REQUEST_TIMEOUT, DEFAULT_STOP_TIMEOUT, DockerImageUpdater
 
 
 @pytest.fixture
@@ -51,7 +51,9 @@ class TestMultiContainerUpdate:
                 ['sonarr-hd', 'sonarr-4k'],
                 'linuxserver/sonarr',
                 '4.0.16.2944-ls299',
-                None
+                None,
+                stop_timeout=DEFAULT_STOP_TIMEOUT,
+                request_timeout=DEFAULT_REQUEST_TIMEOUT,
             )
 
             # Verify update was detected
@@ -196,6 +198,7 @@ class TestSkipAlreadyUpdated:
         """A container already running the target image is skipped (returns True)."""
         container_info = {
             'Config': {'Image': 'linuxserver/sonarr:4.0.16.2944-ls299'},
+            'State': {'Status': 'running'},
         }
         with patch.object(updater, '_get_container_config', return_value=container_info), \
              patch.object(updater.docker, 'stop_container') as mock_stop:
