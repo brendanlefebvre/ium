@@ -7,7 +7,7 @@ This script monitors Docker images for updates by comparing a base tag
 tags that match user-defined regex patterns.
 """
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 import json
 import re
@@ -60,12 +60,13 @@ DEFAULT_BASE_TAG = "latest"
 DEFAULT_STOP_TIMEOUT = 10
 DEFAULT_REQUEST_TIMEOUT = 60
 
+# Registry (HTTPS) request timeout — unrelated to the Docker socket budget above.
+REGISTRY_REQUEST_TIMEOUT = 30
+
 # Container states that mean "not running", so an update may safely continue
 # after a stop request failed.  'paused' is deliberately excluded: a paused
 # container still holds its processes.
 STOPPED_STATUSES = frozenset({'exited', 'created', 'dead'})
-# Registry (HTTPS) request timeout — unrelated to the Docker socket budget above.
-REGISTRY_REQUEST_TIMEOUT = 30
 MANIFEST_ACCEPT_HEADER = (
     "application/vnd.docker.distribution.manifest.list.v2+json,"
     "application/vnd.docker.distribution.manifest.v2+json,"
