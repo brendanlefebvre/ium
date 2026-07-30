@@ -1099,7 +1099,27 @@ class DockerImageUpdater:
         # Skip if already running the target image (e.g. retry after partial failure)
         current_image = container_info.get('Config', {}).get('Image', '')
         if current_image == full_image:
-            self.logger.info(f"Container {container_name} already running {full_image}, skipping")
+            status = (container_info.get('State') or {}).get('Status', '')
+            if status == 'running':
+                self.logger.info(f"Container {container_name} already running {full_image}, skipping")
+                return True
+
+            # On the target image but not running: a previous update was
+            # interrupted after create_container (e.g. its response timed out).
+            # Reporting success here would leave the container down forever,
+            # since every later cycle takes this same short-circuit.  Starting
+            # is idempotent — Docker answers 304 if it is already up.
+            self.logger.warning(
+                f"Container {container_name} is on {full_image} but status is "
+                f"'{status or 'unknown'}' — starting it (interrupted update)"
+            )
+            try:
+                self.docker.start_container(container_name)
+            except DockerAPIError as e:
+                self.logger.error(
+                    f"Could not start {container_name}: {e.message}"
+                )
+                return False
             return True
 
         try:

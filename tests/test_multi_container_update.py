@@ -196,6 +196,7 @@ class TestSkipAlreadyUpdated:
         """A container already running the target image is skipped (returns True)."""
         container_info = {
             'Config': {'Image': 'linuxserver/sonarr:4.0.16.2944-ls299'},
+            'State': {'Status': 'running'},
         }
         with patch.object(updater, '_get_container_config', return_value=container_info), \
              patch.object(updater.docker, 'stop_container') as mock_stop:
