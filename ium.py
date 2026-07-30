@@ -936,6 +936,24 @@ class DockerImageUpdater:
             )
             return None
 
+    def _container_exists(self, container_name: str) -> Optional[bool]:
+        """Whether a container exists, as far as the daemon will say.
+
+        Returns True/False when the daemon answers, and None when it could not
+        be reached — an unreachable daemon must not be mistaken for a 404, since
+        callers use this to decide whether a half-applied operation landed.
+        """
+        try:
+            self.docker.inspect_container(container_name)
+            return True
+        except DockerAPIError as e:
+            if e.status == 404:
+                return False
+            self.logger.warning(
+                f"Could not determine whether '{container_name}' exists: {e.message}"
+            )
+            return None
+
     def _get_containers_for_image(self, image: str) -> List[Dict[str, str]]:
         """Get all containers (running or stopped) using a specific image.
 
@@ -1179,8 +1197,48 @@ class DockerImageUpdater:
             # Rename old container as backup
             backup_name = f"{container_name}_backup_{int(time.time())}"
             self.logger.info(f"Renaming old container to {backup_name}")
-            self.docker.rename_container(container_name, backup_name,
-                                        timeout=request_timeout)
+            try:
+                self.docker.rename_container(container_name, backup_name,
+                                            timeout=request_timeout)
+            except DockerAPIError as rename_err:
+                # The most dangerous call in the update to lose the answer to:
+                # the container is already stopped, and its identity is now
+                # ambiguous.  Creating a replacement blindly could collide with
+                # a container still holding the name, while aborting blindly
+                # could abandon it under the backup name forever.  Ask both.
+                renamed = self._container_exists(backup_name)
+                original = self._container_exists(container_name)
+
+                if renamed is True and original is False:
+                    self.logger.warning(
+                        f"Rename request failed ({rename_err.message}) but "
+                        f"{container_name} is now {backup_name} — continuing "
+                        f"with the update"
+                    )
+                elif original is True:
+                    self.logger.error(
+                        f"Could not rename {container_name} "
+                        f"({rename_err.message}); restarting it and aborting "
+                        f"the update"
+                    )
+                    try:
+                        self.docker.start_container(container_name,
+                                                   timeout=request_timeout)
+                    except DockerAPIError as restart_err:
+                        self.logger.error(
+                            f"Could not restart {container_name} after the "
+                            f"failed rename: {restart_err.message} — start it "
+                            f"manually"
+                        )
+                    return False
+                else:
+                    self.logger.error(
+                        f"Could not rename {container_name} "
+                        f"({rename_err.message}) and cannot determine whether "
+                        f"the rename was applied — aborting without creating a "
+                        f"replacement; check for {backup_name} manually"
+                    )
+                    return False
 
             # Create and start new container
             self.logger.info(f"Creating new container {container_name}...")
