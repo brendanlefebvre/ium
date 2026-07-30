@@ -11,7 +11,7 @@ import json
 import pytest
 from unittest.mock import patch, call
 
-from ium import DockerImageUpdater
+from ium import DEFAULT_REQUEST_TIMEOUT, DEFAULT_STOP_TIMEOUT, DockerImageUpdater
 
 
 @pytest.fixture
@@ -116,7 +116,11 @@ class TestUpdateContainersRegistryForwarding:
                 ["homarr"], "homarr-labs/homarr", "v1.9.0", registry="ghcr.io"
             )
 
-        mock_update.assert_called_once_with("homarr", "homarr-labs/homarr", "v1.9.0", "ghcr.io")
+        mock_update.assert_called_once_with(
+            "homarr", "homarr-labs/homarr", "v1.9.0", "ghcr.io",
+            stop_timeout=DEFAULT_STOP_TIMEOUT,
+            request_timeout=DEFAULT_REQUEST_TIMEOUT,
+        )
 
     def test_registry_forwarded_to_every_container(self, ghcr_updater):
         with patch.object(ghcr_updater, "_update_container", return_value=True) as mock_update:
@@ -153,7 +157,9 @@ class TestCheckAndUpdateRegistryFlow:
             ghcr_updater.check_and_update()
 
         mock_update.assert_called_once_with(
-            ["homarr"], "homarr-labs/homarr", "v1.9.0", "ghcr.io"
+            ["homarr"], "homarr-labs/homarr", "v1.9.0", "ghcr.io",
+            stop_timeout=DEFAULT_STOP_TIMEOUT,
+            request_timeout=DEFAULT_REQUEST_TIMEOUT,
         )
 
     def test_failed_update_does_not_save_state(self, ghcr_updater):

@@ -12,7 +12,7 @@ import pytest
 from unittest.mock import patch
 
 from docker_api import DockerAPIError
-from ium import DockerImageUpdater
+from ium import DEFAULT_REQUEST_TIMEOUT, DockerImageUpdater
 
 
 TARGET_TAG = "4.0.16.2944-ls299"
@@ -52,7 +52,7 @@ class TestInterruptedUpdateRecovery:
 
             result = updater._update_container('sonarr', 'linuxserver/sonarr', TARGET_TAG)
 
-            mock_start.assert_called_once_with('sonarr')
+            mock_start.assert_called_once_with('sonarr', timeout=DEFAULT_REQUEST_TIMEOUT)
             mock_stop.assert_not_called()
             assert result is True
 
@@ -63,7 +63,7 @@ class TestInterruptedUpdateRecovery:
 
             result = updater._update_container('sonarr', 'linuxserver/sonarr', TARGET_TAG)
 
-            mock_start.assert_called_once_with('sonarr')
+            mock_start.assert_called_once_with('sonarr', timeout=DEFAULT_REQUEST_TIMEOUT)
             assert result is True
 
     def test_running_container_on_target_image_is_left_alone(self, updater):

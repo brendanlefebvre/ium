@@ -3,7 +3,7 @@
 import json
 import pytest
 from unittest.mock import Mock, patch, call
-from ium import DockerImageUpdater
+from ium import DEFAULT_REQUEST_TIMEOUT, DEFAULT_STOP_TIMEOUT, DockerImageUpdater
 
 
 @pytest.fixture
@@ -51,7 +51,9 @@ class TestMultiContainerUpdate:
                 ['sonarr-hd', 'sonarr-4k'],
                 'linuxserver/sonarr',
                 '4.0.16.2944-ls299',
-                None
+                None,
+                stop_timeout=DEFAULT_STOP_TIMEOUT,
+                request_timeout=DEFAULT_REQUEST_TIMEOUT,
             )
 
             # Verify update was detected

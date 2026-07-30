@@ -191,31 +191,43 @@ class DockerClient:
         """
         return self._request("GET", f"/containers/{name}/json")
 
-    def stop_container(self, name: str, timeout: int = 10) -> None:
-        """Stop a container."""
+    def stop_container(self, name: str, timeout: int = 10,
+                       request_timeout: Optional[int] = None) -> None:
+        """Stop a container.
+
+        *timeout* is Docker's SIGTERM grace period (the ``t`` parameter).
+        *request_timeout* is the socket read budget allowed on top of it,
+        defaulting to 30 s.  The daemon can take considerably longer than the
+        grace period to answer on slow storage, and a read that expires first
+        leaves the caller unable to tell whether the stop was applied.
+        """
+        slack = 30 if request_timeout is None else request_timeout
         self._request(
             "POST", f"/containers/{name}/stop",
             query={"t": str(timeout)},
-            timeout=timeout + 30,
+            timeout=timeout + slack,
         )
 
-    def rename_container(self, id_or_name: str, new_name: str) -> None:
+    def rename_container(self, id_or_name: str, new_name: str,
+                         timeout: int = 30) -> None:
         """Rename a container."""
         self._request("POST", f"/containers/{id_or_name}/rename",
-                       query={"name": new_name})
+                       query={"name": new_name}, timeout=timeout)
 
-    def create_container(self, name: str, config: Dict[str, Any]) -> str:
+    def create_container(self, name: str, config: Dict[str, Any],
+                         timeout: int = 30) -> str:
         """Create a container.  Returns the new container ID."""
         result = self._request(
             "POST", "/containers/create",
             body=config,
             query={"name": name},
+            timeout=timeout,
         )
         return result["Id"]
 
-    def start_container(self, name: str) -> None:
+    def start_container(self, name: str, timeout: int = 30) -> None:
         """Start an existing container."""
-        self._request("POST", f"/containers/{name}/start")
+        self._request("POST", f"/containers/{name}/start", timeout=timeout)
 
     def remove_container(self, name: str, force: bool = False, timeout: int = 30) -> None:
         """Remove a container."""
@@ -224,9 +236,11 @@ class DockerClient:
 
     # ── Network operations ────────────────────────────────────────
 
-    def connect_network(self, network: str, container_id: str) -> None:
+    def connect_network(self, network: str, container_id: str,
+                        timeout: int = 30) -> None:
         """Connect a container to a network."""
         self._request(
             "POST", f"/networks/{network}/connect",
             body={"Container": container_id},
+            timeout=timeout,
         )
