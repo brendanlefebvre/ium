@@ -1110,21 +1110,7 @@ class DockerImageUpdater:
 
             # Stop the container
             self.logger.info(f"Stopping container {container_name}...")
-            try:
-                self.docker.stop_container(container_name)
-            except DockerAPIError as stop_err:
-                # The stop request may have succeeded on the Docker daemon
-                # side even though the HTTP response timed out.  Check the
-                # actual container state before deciding what to do.
-                post_stop_info = self._get_container_config(container_name)
-                if post_stop_info and post_stop_info.get('State', {}).get('Status') == 'exited':
-                    self.logger.warning(
-                        f"Stop request failed ({stop_err.message}) but container "
-                        f"{container_name} is stopped; proceeding with update"
-                    )
-                else:
-                    # Container is still running (or we can't tell) — abort
-                    raise
+            self.docker.stop_container(container_name)
 
             # Rename old container as backup
             backup_name = f"{container_name}_backup_{int(time.time())}"
@@ -1175,7 +1161,7 @@ class DockerImageUpdater:
             self.logger.info(f"Successfully updated container {container_name}")
             return True
 
-        except (DockerAPIError, TimeoutError, OSError) as e:
+        except DockerAPIError as e:
             self.logger.error(f"Error updating container: {e}")
             return False
 
@@ -1195,11 +1181,7 @@ class DockerImageUpdater:
         results = {}
         for container_name in container_names:
             self.logger.info(f"Updating container {container_name} to {image}:{tag}")
-            try:
-                success = self._update_container(container_name, image, tag, registry)
-            except Exception as e:
-                self.logger.error(f"Unexpected error updating {container_name}: {e}")
-                success = False
+            success = self._update_container(container_name, image, tag, registry)
             results[container_name] = success
 
         # Log summary
