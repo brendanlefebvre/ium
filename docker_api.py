@@ -121,6 +121,18 @@ class DockerClient:
                 return None
 
             return json.loads(raw)
+        except OSError as e:
+            # Socket-level failure — read timeout, connection refused, EPIPE.
+            # TimeoutError and socket.timeout are both OSError subclasses.
+            #
+            # Surface it as DockerAPIError rather than letting it escape: every
+            # caller already handles DockerAPIError, and _update_container's
+            # rollback depends on it.  A bare OSError slips past those handlers,
+            # which leaves a container stopped and renamed with no rollback.
+            #
+            # Status 0 means "no HTTP response" — the daemon may or may not have
+            # applied the request.
+            raise DockerAPIError(0, f"{method} {url}: {e}") from e
         finally:
             conn.close()
 
