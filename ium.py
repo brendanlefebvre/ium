@@ -59,6 +59,11 @@ DEFAULT_BASE_TAG = "latest"
 # the old 40 s stop budget and left the container down (2026-07-29 incident).
 DEFAULT_STOP_TIMEOUT = 10
 DEFAULT_REQUEST_TIMEOUT = 60
+
+# Container states that mean "not running", so an update may safely continue
+# after a stop request failed.  'paused' is deliberately excluded: a paused
+# container still holds its processes.
+STOPPED_STATUSES = frozenset({'exited', 'created', 'dead'})
 # Registry (HTTPS) request timeout — unrelated to the Docker socket budget above.
 REGISTRY_REQUEST_TIMEOUT = 30
 MANIFEST_ACCEPT_HEADER = (
@@ -1145,8 +1150,30 @@ class DockerImageUpdater:
 
             # Stop the container
             self.logger.info(f"Stopping container {container_name}...")
-            self.docker.stop_container(container_name, timeout=stop_timeout,
-                                      request_timeout=request_timeout)
+            try:
+                self.docker.stop_container(container_name, timeout=stop_timeout,
+                                          request_timeout=request_timeout)
+            except DockerAPIError as stop_err:
+                # A failed stop request does not prove the stop did not happen.
+                # The daemon can finish stopping a heavy container after our
+                # socket budget expires, which is exactly what stranded a
+                # container on 2026-07-29.  Inspect before giving up.
+                post_stop = self._get_container_config(container_name)
+                status = ((post_stop or {}).get('State') or {}).get('Status', '')
+                if status in STOPPED_STATUSES:
+                    self.logger.warning(
+                        f"Stop request for {container_name} failed "
+                        f"({stop_err.message}) but the container is '{status}' "
+                        f"— continuing with the update"
+                    )
+                else:
+                    detail = f"still '{status}'" if status else "state unknown"
+                    self.logger.error(
+                        f"Could not stop {container_name} ({stop_err.message}); "
+                        f"{detail} — aborting update to avoid renaming a live "
+                        f"container"
+                    )
+                    return False
 
             # Rename old container as backup
             backup_name = f"{container_name}_backup_{int(time.time())}"

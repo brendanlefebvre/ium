@@ -84,10 +84,13 @@ Only `image` and `regex` are required. Containers are auto-detected — no need 
 
 Raise both for containers that are slow to stop, or on slow storage such as a
 NAS. The stop request gets `stop_timeout + request_timeout` seconds in total,
-so the socket cannot expire before the grace period has even elapsed. If the
-daemon does time out, the update is abandoned and retried on the next cycle —
-the container is left running (or restarted if it had already been stopped),
-never half-migrated.
+so the socket cannot expire before the grace period has even elapsed.
+
+If a request does time out, ium never assumes the worst: the daemon often
+completes the operation after the socket gave up. It inspects the container and
+continues the update if it really did stop, restores the previous container if a
+later step failed, and starts a container that a previous run created but never
+started. A container is never left renamed or half-migrated.
 
 ### Common Patterns
 
