@@ -29,6 +29,7 @@ def _parse_api_version(value: str) -> tuple:
 
 
 def _format_api_version(parsed: tuple) -> str:
+    """Render (1, 44) back into the "v1.44" form used in request paths."""
     return "v" + ".".join(str(part) for part in parsed)
 
 
