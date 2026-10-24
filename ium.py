@@ -9,6 +9,7 @@ tags that match user-defined regex patterns.
 
 __version__ = "1.4.0"
 
+import copy
 import json
 import re
 import secrets
@@ -77,6 +78,12 @@ RESOLVE_FAILURE_FIRST_NOTIFY = timedelta(hours=24)
 RESOLVE_FAILURE_DAILY = timedelta(hours=24)
 RESOLVE_FAILURE_WEEKLY_AFTER = timedelta(days=7)
 RESOLVE_FAILURE_WEEKLY = timedelta(days=7)
+# Digest-mismatch diagnosis gate and sweep size (spec §7.3).
+DIAG_MIN_STREAK = timedelta(hours=2)    # shorter streaks are release races
+DIAG_REFRESH = timedelta(hours=24)      # re-diagnose an unchanged base daily
+DIAG_MOVED_FLOOR = timedelta(hours=6)   # min gap when the base digest moved
+DIAG_MAX_CANDIDATES = 100
+DIAG_MAX_SHARING_TAGS = 5
 
 # Container states that mean "not running", so an update may safely continue
 # after a stop request failed.  'paused' is deliberately excluded: a paused
@@ -119,6 +126,13 @@ class ResolveFailure(Enum):
     REGEX_STALE = "latest is currently `{tags}`, which the regex `{regex}` does not match"
     ROLLING_BASE = ("no tag names the current `{base_tag}` digest; it is probably a rolling build. "
                     "Try a release-line base tag (for example `v3`, `lts`, `stable`)")
+
+
+# diag['outcome'] -> the refined failure it surfaces (spec §7.3).
+_DIAG_REFINEMENTS = {
+    'regex_stale': ResolveFailure.REGEX_STALE,
+    'rolling_base': ResolveFailure.ROLLING_BASE,
+}
 
 
 def _parse_iso(value: Any) -> Optional[datetime]:
@@ -493,22 +507,135 @@ class DockerImageUpdater:
                            base_digest: Optional[str]) -> ResolveFailure:
         """The failure surfaced to the operator this cycle.
 
-        Seam for the §7.3 diagnosis (Task 14): a current ``regex_stale`` /
-        ``rolling_base`` finding in ``rf['diag']`` refines ``NO_DIGEST_MATCH``.
-        For now the raw failure is surfaced unchanged.
+        A ``regex_stale`` / ``rolling_base`` finding in ``rf['diag']`` refines
+        ``NO_DIGEST_MATCH`` while it describes the current base digest
+        (spec §7.3, "Which reason is surfaced each cycle"); otherwise the raw
+        failure is surfaced.
         """
-        return failure
+        diag = rf.get('diag')
+        if (failure is not ResolveFailure.NO_DIGEST_MATCH or not diag
+                or base_digest is None or diag.get('base_digest') != base_digest):
+            return failure
+        return _DIAG_REFINEMENTS.get(diag.get('outcome'), failure)
+
+    def _failure_text(self, failure: ResolveFailure, rf: Dict[str, Any],
+                      base_tag: str, regex: str) -> str:
+        """Operator-facing text for ``failure``; formats the refined templates."""
+        if failure is ResolveFailure.REGEX_STALE:
+            tags = (rf.get('diag') or {}).get('sharing_tags') or []
+            return failure.value.format(tags=', '.join(tags), regex=regex)
+        if failure is ResolveFailure.ROLLING_BASE:
+            return failure.value.format(base_tag=base_tag)
+        return failure.value
+
+    def _should_diagnose(self, rf: Dict[str, Any], base_digest: Optional[str]) -> bool:
+        """The §7.3 gate: a persistent streak with no fresh diagnosis.
+
+        Not a race (>= 2 cycles and >= 2 h), and either never diagnosed, last
+        diagnosed >= 24 h ago, or the base digest moved and the last sweep is
+        >= 6 h old (the floor that stops a rolling base re-sweeping hourly).
+        The caller checks that the raw failure is ``NO_DIGEST_MATCH``.
+        """
+        if base_digest is None:
+            return False
+        now = self._now()
+        since = _parse_iso(rf.get('since'))
+        if since is None or rf.get('cycles', 0) < 2 or now - since < DIAG_MIN_STREAK:
+            return False
+        diag = rf.get('diag')
+        if not diag:
+            return True
+        checked_at = _parse_iso(diag.get('checked_at'))
+        if checked_at is None:
+            return True  # corrupt record: re-diagnose and overwrite it
+        age = now - checked_at
+        if age >= DIAG_REFRESH:
+            return True
+        return diag.get('base_digest') != base_digest and age >= DIAG_MOVED_FLOOR
+
+    def _diagnose_base_tag(self, image: str, base_tag: str, regex: str,
+                           registry: Optional[str], base_digest: str) -> Dict[str, Any]:
+        """Name what ``base_tag`` really is: which tags share its digest (§7.3).
+
+        HEADs up to the last ``DIAG_MAX_CANDIDATES`` tags (Docker Hub in
+        push order, others in list order), excluding ``base_tag``.  Outcome:
+        a sharing tag matches the regex -> ``transient``; sharing tags exist
+        but none matches -> ``regex_stale``; none shares the digest ->
+        ``rolling_base``, unless the evidence is incomplete (no tags listed,
+        or a HEAD failed) -> ``transient``, so a flaky registry never
+        produces a false "rolling build" notification.
+        """
+        reg, namespace, repo = self._parse_image_reference(image)
+        if registry:
+            reg = registry
+        token = self._get_docker_token(reg, namespace, repo)
+        # _get_all_tags_by_date delegates to _get_all_tags off Docker Hub.
+        candidates = [t for t in self._get_all_tags_by_date(reg, namespace, repo)
+                      [-DIAG_MAX_CANDIDATES:] if t != base_tag]
+
+        def fetch_digest(tag: str) -> Tuple[str, Optional[str], DigestStatus]:
+            digest, status = self._get_manifest_digest_head(reg, namespace, repo, tag, token)
+            return (tag, digest, status)
+
+        sharing: List[str] = []
+        head_errors = 0
+        if candidates:
+            with ThreadPoolExecutor(max_workers=min(10, len(candidates))) as executor:
+                futures = [executor.submit(fetch_digest, tag) for tag in candidates]
+                for future in as_completed(futures):
+                    tag, digest, status = future.result()
+                    if status is DigestStatus.OK and digest == base_digest:
+                        sharing.append(tag)
+                    elif status is DigestStatus.ERROR:
+                        head_errors += 1
+
+        pattern = self.compiled_patterns.get(regex)
+        if sharing:
+            matched = pattern is None or any(pattern.match(t) for t in sharing)
+            outcome = 'transient' if matched else 'regex_stale'
+        elif not candidates or head_errors:
+            outcome = 'transient'
+        else:
+            outcome = 'rolling_base'
+        return {
+            'base_digest': base_digest,
+            'checked_at': self._now().isoformat(),
+            'outcome': outcome,
+            'sharing_tags': sorted(sharing)[:DIAG_MAX_SHARING_TAGS],
+        }
 
     def _maybe_diagnose(self, image: str, base_tag: str, regex: str,
                         registry: Optional[str], failure: ResolveFailure,
                         rf: Dict[str, Any], base_digest: Optional[str],
                         image_config: Dict[str, Any]) -> None:
-        """Seam for the §7.3 diagnosis sweep (Task 14); a no-op for now.
+        """Run the §7.3 diagnosis sweep when gated in; send A's notification.
 
-        Runs after streak bookkeeping and before the §7.4 escalation, and
-        may store ``rf['diag']`` and set ``rf['last_notified']``.
+        Runs after streak bookkeeping and before the §7.4 escalation; stores
+        ``rf['diag']`` and, on a new ``regex_stale`` / ``rolling_base``
+        finding, sends ``resolve_failure`` at once and sets
+        ``rf['last_notified']`` (so it counts toward B's gap).
         """
-        return None
+        if failure is not ResolveFailure.NO_DIGEST_MATCH or base_digest is None:
+            return
+        if not self._should_diagnose(rf, base_digest):
+            return
+        previous = rf.get('diag')
+        diag = self._diagnose_base_tag(image, base_tag, regex, registry, base_digest)
+        rf['diag'] = diag
+        self.logger.info(
+            f"Diagnosed {image}:{base_tag}: {diag['outcome']}"
+            + (f" (shares digest with {', '.join(diag['sharing_tags'])})"
+               if diag['sharing_tags'] else "")
+        )
+        if diag['outcome'] not in ('regex_stale', 'rolling_base'):
+            return
+        if previous and (previous.get('outcome'), previous.get('sharing_tags')) == \
+                (diag['outcome'], diag['sharing_tags']):
+            return
+        shown = self._effective_failure(failure, rf, base_digest)
+        self._send_resolve_failure(image, base_tag, rf,
+                                   self._failure_text(shown, rf, base_tag, regex),
+                                   base_digest, image_config)
 
     def _escalate_resolve_failure(self, image: str, base_tag: str, rf: Dict[str, Any],
                                   failure_text: str, image_config: Dict[str, Any]) -> None:
@@ -535,18 +662,31 @@ class DockerImageUpdater:
                     else RESOLVE_FAILURE_WEEKLY)
         if gap is not None and gap < interval:
             return
+        self._send_resolve_failure(image, base_tag, rf, failure_text,
+                                   self._last_base_digest, image_config)
 
+    def _send_resolve_failure(self, image: str, base_tag: str, rf: Dict[str, Any],
+                              failure_text: str, base_digest: Optional[str],
+                              image_config: Dict[str, Any]) -> None:
+        """Send one ``resolve_failure`` (§7.4 content, §7.5 payload); set ``last_notified``.
+
+        Shared by A's immediate send and B's schedule, so either counts
+        toward the other's gap.
+        """
+        now = self._now()
+        since = _parse_iso(rf.get('since')) or now
         saved_state = self.state.get(image)
         current_tag = saved_state.tag if saved_state else 'unknown'
+        sep = '' if failure_text.endswith('.') else '.'
         message = (
-            f"{image} cannot resolve {base_tag}: {failure_text} "
+            f"{image} cannot resolve {base_tag}: {failure_text}{sep} "
             f"Failing since {since.strftime('%Y-%m-%d %H:%M')} "
-            f"({_format_duration(age)}, {rf.get('cycles')} cycles)."
+            f"({_format_duration(now - since)}, {rf.get('cycles')} cycles)."
         )
         send_notifications(
             self.config.get('notifications'),
             image=image, old_version=current_tag, new_version=base_tag,
-            event='resolve_failure', digest=self._last_base_digest or '',
+            event='resolve_failure', digest=base_digest or '',
             auto_update=image_config.get('auto_update', False),
             message=message,
         )
@@ -1899,21 +2039,24 @@ class DockerImageUpdater:
                 failure = self._last_resolve_failure or ResolveFailure.INTERNAL
                 base_digest = self._last_base_digest
 
-                # Streak bookkeeping (spec §7.2).  Copy so the saved record
-                # is only replaced via _write_resolve_failure.
-                rf = dict((saved_state.resolve_failure if saved_state else None) or {})
+                # Streak bookkeeping (spec §7.2).  Deep copy (``diag`` is
+                # nested) so the saved record is only replaced via
+                # _write_resolve_failure, never mutated in place.
+                rf = copy.deepcopy((saved_state.resolve_failure if saved_state else None) or {})
                 if not rf:
                     rf = {'reason': failure.name, 'since': self._now().isoformat(),
                           'cycles': 0, 'last_notified': None}
                 rf['reason'] = failure.name  # may change mid-streak; `since` does not
                 rf['cycles'] = rf.get('cycles', 0) + 1
 
-                # Diagnosis (spec §7.3, Task 14) slots in here.
+                # Diagnosis (spec §7.3): at most one sweep, gated, and only
+                # for NO_DIGEST_MATCH; may send A's notification.
                 self._maybe_diagnose(image, base_tag, regex, registry, failure,
                                      rf, base_digest, image_config)
                 shown = self._effective_failure(failure, rf, base_digest)
+                shown_text = self._failure_text(shown, rf, base_tag, regex)
 
-                message = f"Could not determine version for {image}:{base_tag}: {shown.value}"
+                message = f"Could not determine version for {image}:{base_tag}: {shown_text}"
                 self.logger.warning(message)
                 if progress_callback:
                     payload = {
@@ -1927,7 +2070,7 @@ class DockerImageUpdater:
                         payload['failing_cycles'] = rf['cycles']
                     progress_callback('check_error', payload)
 
-                self._escalate_resolve_failure(image, base_tag, rf, shown.value, image_config)
+                self._escalate_resolve_failure(image, base_tag, rf, shown_text, image_config)
                 # Persist every failing cycle (the counter changes).
                 self._write_resolve_failure(image, saved_state, base_tag, rf)
                 continue

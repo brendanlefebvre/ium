@@ -1,4 +1,4 @@
-"""Resolver failure streaks and escalation (spec Part 7, §7.1, §7.2, §7.4, §7.6).
+"""Resolver failure streaks, escalation and diagnosis (spec Part 7, §7.1-§7.4, §7.6).
 
 Every failing cycle bumps a per-image ``resolve_failure`` record; nothing is
 sent before 24 h of continuous failure, then daily through day 7, then
@@ -13,7 +13,7 @@ from unittest.mock import patch
 import pytest
 
 from docker_api import DockerAPIError
-from ium import DockerImageUpdater, ImageState, ResolveFailure
+from ium import DigestStatus, DockerImageUpdater, ImageState, ResolveFailure
 
 IMAGE = 'linuxserver/qbittorrent'
 TAG = '5.0.0-r0-ls400'
@@ -296,3 +296,318 @@ def test_record_round_trips(updater):
     updater.state = updater._load_state()
     updater._save_state()
     assert _reload(updater) == first
+
+
+# --- Diagnosis (spec §7.3) -------------------------------------------------
+
+REGEX = r"^[0-9]+\.[0-9]+\.[0-9]+-r[0-9]+-ls[0-9]+$"
+STALE_TAG = '5.3.0_v2.1.2-ls484'   # what qbittorrent's `latest` really is
+HUB_TAGS = ['5.0.0-r0-ls399', '5.0.0-r0-ls400', 'latest', STALE_TAG]
+
+
+def _rf(since, cycles, diag=None, last_notified=None):
+    rf = {'reason': 'NO_DIGEST_MATCH', 'since': since.isoformat(),
+          'cycles': cycles, 'last_notified': last_notified}
+    if diag is not None:
+        rf['diag'] = diag
+    return rf
+
+
+def _diag(checked_at, outcome='transient', sharing=(), base_digest=BASE_DIGEST):
+    return {'base_digest': base_digest, 'checked_at': checked_at.isoformat(),
+            'outcome': outcome, 'sharing_tags': list(sharing)}
+
+
+def _diag_fail(updater, now=NOW, tags=HUB_TAGS, sharing=(STALE_TAG,),
+               base_digest=BASE_DIGEST, failure=ResolveFailure.NO_DIGEST_MATCH):
+    """One failing cycle with the diagnosis sweep's registry calls faked.
+
+    ``sharing`` lists the candidate tags whose digest equals the base digest.
+    Returns (notify mock, tag-listing mock, HEADed tags, check_error payloads).
+    """
+    def fake_find(*args, **kwargs):
+        updater._last_resolve_failure = failure
+        updater._last_base_digest = base_digest
+        return None
+
+    def fake_head(registry, namespace, repo, tag, token):
+        heads.append(tag)
+        return (base_digest if tag in sharing else f'sha256:{tag}', DigestStatus.OK)
+
+    heads, events = [], []
+    with patch.object(updater, 'find_matching_tag', side_effect=fake_find), \
+         patch.object(updater, '_get_all_tags_by_date', return_value=list(tags)) as listing, \
+         patch.object(updater, '_get_manifest_digest_head', side_effect=fake_head), \
+         patch.object(updater, '_get_docker_token', return_value='tok'), \
+         patch('ium.send_notifications') as notify, \
+         patch.object(updater, '_now', return_value=now):
+        updater.check_and_update(
+            progress_callback=lambda e, d: events.append(d) if e == 'check_error' else None)
+    return notify, listing, heads, events
+
+
+# Gate: rf is seeded with cycles one short; the run bumps it.
+
+def test_gate_cycle1_no(updater):
+    _seed(updater, resolve_failure=_rf(NOW - timedelta(hours=3), 0))
+    _, listing, _, _ = _diag_fail(updater)
+    listing.assert_not_called()
+
+
+def test_gate_cycle2_90min_no(updater):
+    _seed(updater, resolve_failure=_rf(NOW - timedelta(minutes=90), 1))
+    _, listing, _, _ = _diag_fail(updater)
+    listing.assert_not_called()
+
+
+def test_gate_cycle2_2h_yes(updater):
+    _seed(updater, resolve_failure=_rf(NOW - timedelta(hours=2), 1))
+    _, listing, _, _ = _diag_fail(updater)
+    assert listing.call_count == 1
+    assert _reload(updater).resolve_failure['diag']['checked_at'] == NOW_ISO
+
+
+def test_gate_same_digest_within_24h_no(updater):
+    _seed(updater, resolve_failure=_rf(
+        NOW - timedelta(hours=48), 40, diag=_diag(NOW - timedelta(hours=23, minutes=59))))
+    _, listing, _, _ = _diag_fail(updater)
+    listing.assert_not_called()
+
+    _seed(updater, resolve_failure=_rf(
+        NOW - timedelta(hours=48), 40, diag=_diag(NOW - timedelta(hours=24))))
+    _, listing, _, _ = _diag_fail(updater)
+    assert listing.call_count == 1
+
+
+def test_gate_digest_changed_5h_no(updater):
+    _seed(updater, resolve_failure=_rf(
+        NOW - timedelta(hours=48), 40,
+        diag=_diag(NOW - timedelta(hours=5), base_digest='sha256:older')))
+    _, listing, _, _ = _diag_fail(updater)
+    listing.assert_not_called()
+
+
+def test_gate_digest_changed_6h_yes(updater):
+    _seed(updater, resolve_failure=_rf(
+        NOW - timedelta(hours=48), 40,
+        diag=_diag(NOW - timedelta(hours=6), base_digest='sha256:older')))
+    _, listing, _, _ = _diag_fail(updater)
+    assert listing.call_count == 1
+    assert _reload(updater).resolve_failure['diag']['base_digest'] == BASE_DIGEST
+
+
+@pytest.mark.parametrize('failure', [f for f in ResolveFailure
+                                     if f is not ResolveFailure.NO_DIGEST_MATCH])
+def test_other_failures_never_sweep(updater, failure):
+    _seed(updater, resolve_failure=_rf(NOW - timedelta(hours=30), 30))
+    _, listing, heads, _ = _diag_fail(updater, failure=failure)
+    listing.assert_not_called()
+    assert heads == []
+    assert 'diag' not in _reload(updater).resolve_failure
+
+
+def test_unknown_base_digest_never_sweeps(updater):
+    _seed(updater, resolve_failure=_rf(NOW - timedelta(hours=30), 30))
+    _, listing, _, _ = _diag_fail(updater, base_digest=None)
+    listing.assert_not_called()
+
+
+# Outcomes
+
+def test_qbittorrent_regex_stale(updater):
+    _seed(updater, resolve_failure=_rf(NOW - timedelta(hours=3), 2))
+    notify, listing, _, events = _diag_fail(updater)
+
+    assert listing.call_count == 1
+    rf = _reload(updater).resolve_failure
+    assert rf['diag'] == {'base_digest': BASE_DIGEST, 'checked_at': NOW_ISO,
+                          'outcome': 'regex_stale', 'sharing_tags': [STALE_TAG]}
+    assert rf['reason'] == 'NO_DIGEST_MATCH'  # raw reason stays stored
+    assert rf['last_notified'] == NOW_ISO
+    sent = _sends(notify)
+    assert len(sent) == 1
+    kw = sent[0].kwargs
+    assert STALE_TAG in kw['message'] and REGEX in kw['message']
+    assert kw['old_version'] == TAG
+    assert kw['new_version'] == 'latest'
+    assert kw['digest'] == BASE_DIGEST
+    assert kw['auto_update'] is True
+    refined = ResolveFailure.REGEX_STALE.value.format(tags=STALE_TAG, regex=REGEX)
+    assert events[0]['reason'] == 'regex_stale'
+    assert refined in events[0]['error']
+
+
+def test_gluetun_rolling_base(updater):
+    _seed(updater, resolve_failure=_rf(NOW - timedelta(hours=3), 2))
+    notify, _, _, events = _diag_fail(updater, sharing=())
+
+    diag = _reload(updater).resolve_failure['diag']
+    assert diag['outcome'] == 'rolling_base'
+    assert diag['sharing_tags'] == []
+    sent = _sends(notify)
+    assert len(sent) == 1
+    assert 'rolling' in sent[0].kwargs['message']
+    assert '`latest`' in sent[0].kwargs['message']
+    assert events[0]['reason'] == 'rolling_base'
+
+
+def test_transient_no_notify(updater):
+    _seed(updater, resolve_failure=_rf(NOW - timedelta(hours=3), 2))
+    notify, _, _, events = _diag_fail(updater, sharing=(STALE_TAG, '5.0.0-r0-ls400'))
+
+    rf = _reload(updater).resolve_failure
+    assert rf['diag']['outcome'] == 'transient'
+    assert rf['last_notified'] is None
+    notify.assert_not_called()
+    assert events[0]['reason'] == 'no_digest_match'
+    assert ResolveFailure.NO_DIGEST_MATCH.value in events[0]['error']
+
+
+def test_same_finding_no_second_notify(updater):
+    last = (NOW - timedelta(hours=1)).isoformat()
+    _seed(updater, resolve_failure=_rf(
+        NOW - timedelta(hours=30), 30, last_notified=last,
+        diag=_diag(NOW - timedelta(hours=24), 'regex_stale', [STALE_TAG])))
+    notify, listing, _, _ = _diag_fail(updater)
+
+    assert listing.call_count == 1  # it did re-sweep
+    notify.assert_not_called()
+    rf = _reload(updater).resolve_failure
+    assert rf['last_notified'] == last
+    assert rf['diag']['checked_at'] == NOW_ISO
+
+
+def test_new_sharing_set_notifies_again(updater):
+    last = (NOW - timedelta(hours=1)).isoformat()
+    _seed(updater, resolve_failure=_rf(
+        NOW - timedelta(hours=30), 30, last_notified=last,
+        diag=_diag(NOW - timedelta(hours=24), 'regex_stale', ['5.3.0_v2.1.2-ls483'])))
+    notify, _, _, _ = _diag_fail(updater)
+
+    sent = _sends(notify)
+    assert len(sent) == 1
+    assert STALE_TAG in sent[0].kwargs['message']
+    assert _reload(updater).resolve_failure['last_notified'] == NOW_ISO
+
+
+def test_refined_reason_persists_between_sweeps(updater):
+    _seed(updater, resolve_failure=_rf(
+        NOW - timedelta(hours=5), 5,
+        diag=_diag(NOW - timedelta(hours=1), 'regex_stale', [STALE_TAG])))
+    notify, listing, _, events = _diag_fail(updater)
+
+    listing.assert_not_called()
+    notify.assert_not_called()
+    refined = ResolveFailure.REGEX_STALE.value.format(tags=STALE_TAG, regex=REGEX)
+    assert refined in events[0]['error']
+    assert events[0]['reason'] == 'regex_stale'
+
+
+def test_raw_reason_after_digest_moves_before_sweep(updater):
+    _seed(updater, resolve_failure=_rf(
+        NOW - timedelta(hours=5), 5,
+        diag=_diag(NOW - timedelta(hours=1), 'regex_stale', [STALE_TAG])))
+    _, listing, _, events = _diag_fail(updater, base_digest='sha256:moved')
+
+    listing.assert_not_called()  # 6 h floor
+    assert events[0]['reason'] == 'no_digest_match'
+    assert ResolveFailure.NO_DIGEST_MATCH.value in events[0]['error']
+
+
+def test_sweep_does_not_mutate_saved_record(updater):
+    old = _diag(NOW - timedelta(hours=25), 'regex_stale', ['5.3.0_v2.1.2-ls483'])
+    seeded = _rf(NOW - timedelta(hours=30), 30, diag=old)
+    _seed(updater, resolve_failure=seeded)
+    _diag_fail(updater)
+    assert seeded['diag'] is old
+    assert old['sharing_tags'] == ['5.3.0_v2.1.2-ls483']
+    assert old['checked_at'] == (NOW - timedelta(hours=25)).isoformat()
+    assert seeded['cycles'] == 30
+
+
+# Candidate set (unit level)
+
+def _diagnose(updater, tags=None, all_tags=None, registry_override=None, sharing=()):
+    heads = []
+
+    def fake_head(registry, namespace, repo, tag, token):
+        heads.append(tag)
+        return (BASE_DIGEST if tag in sharing else f'sha256:{tag}', DigestStatus.OK)
+
+    with patch.object(updater, '_get_manifest_digest_head', side_effect=fake_head), \
+         patch.object(updater, '_get_docker_token', return_value='tok'), \
+         patch.object(updater, '_get_all_tags', return_value=list(all_tags or [])) as plain, \
+         patch.object(updater, '_now', return_value=NOW):
+        if tags is not None:
+            with patch.object(updater, '_get_all_tags_by_date', return_value=list(tags)):
+                diag = updater._diagnose_base_tag(IMAGE, 'latest', REGEX,
+                                                  registry_override, BASE_DIGEST)
+        else:
+            diag = updater._diagnose_base_tag(IMAGE, 'latest', REGEX,
+                                              registry_override, BASE_DIGEST)
+    return diag, heads, plain
+
+
+def test_hub_candidates_last_100_of_date_order(updater):
+    tags = [f'old{i}' for i in range(150)]
+    _, heads, _ = _diagnose(updater, tags=tags)
+    assert sorted(heads) == sorted(tags[-100:])
+
+
+def test_non_hub_candidates_last_100_of_list(updater):
+    tags = [f'v{i}' for i in range(150)]
+    _, heads, plain = _diagnose(updater, all_tags=tags, registry_override='ghcr.io')
+    assert plain.call_args.args[0] == 'ghcr.io'
+    assert sorted(heads) == sorted(tags[-100:])
+
+
+def test_base_tag_excluded(updater):
+    diag, heads, _ = _diagnose(updater, tags=['a', 'latest', 'b'], sharing=('latest', 'b'))
+    assert 'latest' not in heads
+    assert sorted(heads) == ['a', 'b']
+    assert diag['sharing_tags'] == ['b']
+
+
+def test_sharing_tags_sorted_and_capped(updater):
+    tags = [f't{i}' for i in range(9, 0, -1)]
+    diag, _, _ = _diagnose(updater, tags=tags, sharing=tuple(tags))
+    assert diag == {'base_digest': BASE_DIGEST, 'checked_at': NOW_ISO,
+                    'outcome': 'regex_stale',
+                    'sharing_tags': ['t1', 't2', 't3', 't4', 't5']}
+
+
+def test_head_errors_are_not_counted_as_sharing(updater):
+    def fake_head(registry, namespace, repo, tag, token):
+        return (BASE_DIGEST, DigestStatus.ERROR)
+
+    with patch.object(updater, '_get_manifest_digest_head', side_effect=fake_head), \
+         patch.object(updater, '_get_docker_token', return_value='tok'), \
+         patch.object(updater, '_get_all_tags_by_date', return_value=['a', 'b']), \
+         patch.object(updater, '_now', return_value=NOW):
+        diag = updater._diagnose_base_tag(IMAGE, 'latest', REGEX, None, BASE_DIGEST)
+    assert diag['sharing_tags'] == []
+    # Incomplete evidence never claims a rolling build.
+    assert diag['outcome'] == 'transient'
+
+
+def test_empty_tag_listing_is_transient(updater):
+    diag, heads, _ = _diagnose(updater, tags=[])
+    assert heads == []
+    assert diag['outcome'] == 'transient'
+
+
+# A then B
+
+def test_a_send_delays_first_b_send(updater):
+    """A at hour 3 counts as a send: no B at 24 h, first B at 27 h (§7.4)."""
+    sends = {}
+    for h in [0, 1, 3, 24, 26, 27]:
+        notify, _, _, _ = _diag_fail(updater, now=NOW + timedelta(hours=h))
+        sends[h] = _sends(notify)
+
+    assert [h for h, s in sends.items() if s] == [3, 27]
+    assert len(sends[3]) == 1 and len(sends[27]) == 1
+    refined = ResolveFailure.REGEX_STALE.value.format(tags=STALE_TAG, regex=REGEX)
+    assert f"{refined}. Failing since" in sends[27][0].kwargs['message']
+    rf = _reload(updater).resolve_failure
+    assert rf['last_notified'] == (NOW + timedelta(hours=27)).isoformat()
