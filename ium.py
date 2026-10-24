@@ -94,6 +94,26 @@ class DigestStatus(Enum):
     ERROR = "error"           # transient/auth/protocol failure: result unknown
 
 
+class ResolveFailure(Enum):
+    """Why ``find_matching_tag`` could not resolve a version (spec §6).
+
+    ``REGEX_STALE`` and ``ROLLING_BASE`` are refined diagnoses of
+    ``NO_DIGEST_MATCH`` (spec §7.3); their values are ``str.format``
+    templates.  The other values contain no braces.
+    """
+    REGISTRY_ERROR = "Transient registry error resolving the base tag; will retry next cycle"
+    NO_TAGS = "Could not list tags from the registry"
+    NO_REGEX_MATCH = "No tags match the regex"
+    NO_DIGEST_MATCH = ("Tags match the regex but none shares the base tag's digest; "
+                       "the base tag may be a rolling build (try a release-line base_tag such as v3) "
+                       "or a release may be mid-publish")
+    NO_FALLBACK_DIGEST = "Base tag does not exist and the newest matching tag could not be read"
+    INTERNAL = "Internal error: regex not found in the compiled-pattern cache; re-save the config or restart ium"
+    REGEX_STALE = "latest is currently `{tags}`, which the regex `{regex}` does not match"
+    ROLLING_BASE = ("no tag names the current `{base_tag}` digest; it is probably a rolling build. "
+                    "Try a release-line base tag (for example `v3`, `lts`, `stable`)")
+
+
 def _natural_sort_key(tag: str) -> tuple:
     """Sort key ordering digit runs numerically and text runs lexically.
 
@@ -344,6 +364,10 @@ class DockerImageUpdater:
         self.compiled_patterns = {}  # Cache for compiled regex patterns
         # Per-registry cache of discovered (realm, service) — None means no auth required.
         self._auth_endpoints: Dict[str, Optional[Tuple[str, str]]] = {}
+        # Set by find_matching_tag: why the last call returned None (None on
+        # success) and the base tag's digest once its HEAD resolved.
+        self._last_resolve_failure: Optional[ResolveFailure] = None
+        self._last_base_digest: Optional[str] = None
         self.config = self._load_config()
         self.state = self._load_state()
         
@@ -878,6 +902,10 @@ class DockerImageUpdater:
             The newest-matching-tag fallback fires only when the base tag
             genuinely does not exist (HTTP 404).
         """
+        # Every `return None` below records why (spec §6); success leaves None.
+        self._last_resolve_failure = None
+        self._last_base_digest = None
+
         # Parse image reference
         registry, namespace, repo = self._parse_image_reference(image)
         if registry_override:
@@ -898,7 +926,10 @@ class DockerImageUpdater:
                 f"Transient registry error resolving {image}:{base_tag}; "
                 f"skipping check this cycle"
             )
+            self._last_resolve_failure = ResolveFailure.REGISTRY_ERROR
             return None
+        if base_status is DigestStatus.OK:
+            self._last_base_digest = base_digest
         if base_status is DigestStatus.NOT_FOUND:
             self.logger.warning(f"Tag '{base_tag}' not found in registry for {image}")
 
@@ -906,12 +937,14 @@ class DockerImageUpdater:
         all_tags = self._get_all_tags(registry, namespace, repo, token)
         if not all_tags:
             self.logger.error(f"Could not get tags for {image}")
+            self._last_resolve_failure = ResolveFailure.NO_TAGS
             return None
 
         # Get cached compiled pattern
         pattern = self.compiled_patterns.get(regex_pattern)
         if not pattern:
             self.logger.error(f"Pattern not found in cache: '{regex_pattern}'")
+            self._last_resolve_failure = ResolveFailure.INTERNAL
             return None
 
         # Find tags matching the pattern
@@ -920,6 +953,7 @@ class DockerImageUpdater:
 
         if not matching_tags:
             self.logger.warning(f"No tags matching pattern '{regex_pattern}'")
+            self._last_resolve_failure = ResolveFailure.NO_REGEX_MATCH
             return None
 
         # Newest first.  Natural sort: digit runs compare numerically, so
@@ -958,6 +992,7 @@ class DockerImageUpdater:
                 f"with {image}:{base_tag} (mid-release race or transient "
                 f"registry errors); skipping check this cycle"
             )
+            self._last_resolve_failure = ResolveFailure.NO_DIGEST_MATCH
             return None
 
         # Base tag genuinely does not exist (true 404, e.g. a repo that
@@ -974,6 +1009,7 @@ class DockerImageUpdater:
             return (latest_tag, latest_digest)
 
         self.logger.error(f"Could not get digest for latest matching tag {image}:{latest_tag}")
+        self._last_resolve_failure = ResolveFailure.NO_FALLBACK_DIGEST
         return None
         
     def _qualified_image(self, image: str, registry: Optional[str]) -> str:
@@ -1723,12 +1759,17 @@ class DockerImageUpdater:
             result = self.find_matching_tag(image, base_tag, regex, registry)
 
             if not result:
-                self.logger.warning(f"Could not determine version for {image}:{base_tag}")
+                # Defensive: every failing branch records a reason, so None
+                # here would be a bug; still say something rather than crash.
+                failure = self._last_resolve_failure or ResolveFailure.INTERNAL
+                message = f"Could not determine version for {image}:{base_tag}: {failure.value}"
+                self.logger.warning(message)
                 if progress_callback:
                     progress_callback('check_error', {
                         'image': image,
                         'base_tag': base_tag,
-                        'error': f"Could not determine version for {image}:{base_tag} - no matching tags found"
+                        'reason': failure.name.lower(),
+                        'error': message,
                     })
                 continue
 

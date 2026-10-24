@@ -15,7 +15,9 @@ from unittest.mock import patch, MagicMock
 import pytest
 import requests
 
-from ium import DockerImageUpdater, DigestStatus, _natural_sort_key
+from ium import (
+    DockerImageUpdater, DigestStatus, ResolveFailure, _natural_sort_key,
+)
 
 
 @pytest.fixture
@@ -378,3 +380,153 @@ class TestMay24Regression:
         assert u.state["forgejo/forgejo"].digest == "sha256:current"
         # Only the base-tag HEAD was attempted - no tag listing happened.
         assert all("/manifests/15" in c.args[1] for c in mock_request.call_args_list)
+
+
+class TestResolveFailureReason:
+    """Every failing find_matching_tag branch records a specific reason (spec §6).
+
+    Each case asserts the recorded member directly, then drives the same
+    registry picture through check_and_update and checks that the
+    check_error payload carries the member's text and lower-cased name.
+    """
+
+    TAGS = TestFindMatchingTagDecisionTable.TAGS
+
+    def _wire(self, u, digest_map, tags=None):
+        """Serve HEADs from digest_map (unlisted -> NOT_FOUND) and list *tags*."""
+        u._get_docker_token = MagicMock(return_value="tok")
+        u._get_all_tags = MagicMock(
+            return_value=list(self.TAGS if tags is None else tags))
+        u.compiled_patterns[FORGEJO_PATTERN] = re.compile(FORGEJO_PATTERN)
+
+        def head(registry, namespace, repo, tag, token):
+            return digest_map.get(tag, (None, DigestStatus.NOT_FOUND))
+
+        u._get_manifest_digest_head = MagicMock(side_effect=head)
+
+    @staticmethod
+    def _check_errors(u):
+        events = []
+        u.check_and_update(progress_callback=lambda e, d: events.append((e, d)))
+        return [d for e, d in events if e == 'check_error']
+
+    def _assert_payload(self, errors, member):
+        assert len(errors) == 1
+        payload = errors[0]
+        assert payload['image'] == "forgejo/forgejo"
+        assert payload['base_tag'] == "15"
+        assert payload['reason'] == member.name.lower()
+        assert member.value in payload['error']
+        assert payload['error'] == (
+            f"Could not determine version for forgejo/forgejo:15: {member.value}")
+
+    def _assert_reason(self, updater, tmp_path, member, digest_map, tags=None):
+        self._wire(updater, digest_map, tags)
+        result = updater.find_matching_tag(
+            "forgejo/forgejo", "15", FORGEJO_PATTERN, "codeberg.org")
+        assert result is None
+        assert updater._last_resolve_failure is member
+
+        # Same registry picture, through check_and_update.
+        u = _make_updater(tmp_path, CURRENT_STATE)
+        self._wire(u, digest_map, tags)
+        self._assert_payload(self._check_errors(u), member)
+
+    def test_registry_error(self, updater, tmp_path):
+        self._assert_reason(updater, tmp_path, ResolveFailure.REGISTRY_ERROR, {
+            "15": (None, DigestStatus.ERROR),
+        })
+        assert updater._last_base_digest is None
+
+    @patch("ium.time.sleep")
+    @patch("ium.requests.request")
+    def test_registry_error_http_level(self, mock_request, _sleep, tmp_path):
+        # The May 24 replay at HTTP level now names the real cause.
+        u = _make_updater(tmp_path, CURRENT_STATE)
+        u._get_docker_token = MagicMock(return_value="tok")
+        mock_request.side_effect = [_mock_response(503)] * 4
+        self._assert_payload(self._check_errors(u), ResolveFailure.REGISTRY_ERROR)
+
+    def test_no_tags(self, updater, tmp_path):
+        self._assert_reason(updater, tmp_path, ResolveFailure.NO_TAGS, {
+            "15": ("sha256:current", DigestStatus.OK),
+        }, tags=[])
+
+    def test_no_regex_match(self, updater, tmp_path):
+        self._assert_reason(updater, tmp_path, ResolveFailure.NO_REGEX_MATCH, {
+            "15": ("sha256:current", DigestStatus.OK),
+        }, tags=["latest", "nightly"])
+
+    def test_no_digest_match(self, updater, tmp_path):
+        self._assert_reason(updater, tmp_path, ResolveFailure.NO_DIGEST_MATCH, {
+            "15": ("sha256:brand-new", DigestStatus.OK),
+            "15.0.2": ("sha256:current", DigestStatus.OK),
+            "15.0.1": ("sha256:older", DigestStatus.OK),
+            "12.0.1": ("sha256:old", DigestStatus.OK),
+            "9.0.3": ("sha256:ancient", DigestStatus.OK),
+        })
+        # The base digest is exposed for Part 7's diagnosis.
+        assert updater._last_base_digest == "sha256:brand-new"
+
+    def test_no_fallback_digest(self, updater, tmp_path):
+        self._assert_reason(updater, tmp_path, ResolveFailure.NO_FALLBACK_DIGEST, {
+            "15": (None, DigestStatus.NOT_FOUND),
+            "15.0.2": (None, DigestStatus.ERROR),
+        })
+        assert updater._last_base_digest is None
+
+    def test_internal_on_pattern_cache_miss(self, updater, tmp_path):
+        self._wire(updater, {"15": ("sha256:current", DigestStatus.OK)})
+        del updater.compiled_patterns[FORGEJO_PATTERN]
+        result = updater.find_matching_tag(
+            "forgejo/forgejo", "15", FORGEJO_PATTERN, "codeberg.org")
+        assert result is None
+        assert updater._last_resolve_failure is ResolveFailure.INTERNAL
+
+        u = _make_updater(tmp_path, CURRENT_STATE)
+        self._wire(u, {"15": ("sha256:current", DigestStatus.OK)})
+        del u.compiled_patterns[FORGEJO_PATTERN]
+        self._assert_payload(self._check_errors(u), ResolveFailure.INTERNAL)
+
+    def test_none_failure_is_treated_as_internal(self, tmp_path):
+        # Defensive: a None result with no recorded reason still says something.
+        u = _make_updater(tmp_path, CURRENT_STATE)
+        u.find_matching_tag = MagicMock(return_value=None)
+        self._assert_payload(self._check_errors(u), ResolveFailure.INTERNAL)
+
+    def test_success_leaves_none(self, updater):
+        # A prior failure must not leak into a later successful call.
+        self._wire(updater, {"15": (None, DigestStatus.ERROR)})
+        updater.find_matching_tag(
+            "forgejo/forgejo", "15", FORGEJO_PATTERN, "codeberg.org")
+        assert updater._last_resolve_failure is ResolveFailure.REGISTRY_ERROR
+
+        self._wire(updater, {
+            "15": ("sha256:current", DigestStatus.OK),
+            "15.0.2": ("sha256:current", DigestStatus.OK),
+        })
+        result = updater.find_matching_tag(
+            "forgejo/forgejo", "15", FORGEJO_PATTERN, "codeberg.org")
+        assert result == ("15.0.2", "sha256:current")
+        assert updater._last_resolve_failure is None
+        assert updater._last_base_digest == "sha256:current"
+
+    def test_attributes_initialised_in_init(self, updater):
+        assert updater._last_resolve_failure is None
+        assert updater._last_base_digest is None
+
+    def test_refined_members_are_format_templates(self):
+        # A later task formats these; the plain members carry no placeholders.
+        assert ResolveFailure.REGEX_STALE.value.format(
+            tags="v1, v2", regex="^x$") == (
+            "latest is currently `v1, v2`, which the regex `^x$` does not match")
+        assert ResolveFailure.ROLLING_BASE.value.format(base_tag="latest") == (
+            "no tag names the current `latest` digest; it is probably a "
+            "rolling build. Try a release-line base tag (for example `v3`, "
+            "`lts`, `stable`)")
+        plain = set(ResolveFailure) - {ResolveFailure.REGEX_STALE,
+                                       ResolveFailure.ROLLING_BASE}
+        assert all('{' not in m.value and '}' not in m.value for m in plain)
+        assert [m.name for m in ResolveFailure] == [
+            "REGISTRY_ERROR", "NO_TAGS", "NO_REGEX_MATCH", "NO_DIGEST_MATCH",
+            "NO_FALLBACK_DIGEST", "INTERNAL", "REGEX_STALE", "ROLLING_BASE"]
