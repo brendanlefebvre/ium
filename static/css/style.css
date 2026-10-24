@@ -497,6 +497,7 @@ body {
 }
 .badge-auto-update { color: var(--success); border-color: var(--success); background: var(--success-soft); }
 .badge-base-tag    { color: var(--accent);  border-color: var(--accent);  background: var(--accent-soft); }
+.badge-downgrade   { color: var(--warning); border-color: var(--warning); background: var(--warning-soft); }
 
 .tab-badge {
     display: inline-block;

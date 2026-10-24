@@ -224,6 +224,10 @@ def run_check():
             # Add to history
             if updates:
                 for update in updates:
+                    # A pending downgrade is re-reported every cycle; record
+                    # only its first detection so it cannot crowd out history.
+                    if update.get('repeat'):
+                        continue
                     update_history.append({
                         'timestamp': last_check_time.isoformat(),
                         'image': update['image'],
@@ -511,6 +515,33 @@ def api_apply_update():
     except Exception as e:
         logger.error(f"apply-update failed for {image}: {e}")
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/updates/dismiss', methods=['POST'])
+@require_updater
+def api_dismiss_update():
+    """Ignore a pending downgrade until the registry offers something else."""
+    global last_updates
+
+    data = request.json or {}
+    image = (data.get('image') or '').strip()
+
+    image_state = updater.state.get(image)
+    pending = getattr(image_state, 'pending', None)
+    if not pending or pending.get('reason') != 'downgrade':
+        return jsonify({'error': f'No pending downgrade found for {image}'}), 404
+
+    pending['dismissed'] = True
+    updater._save_state()
+
+    last_updates = [u for u in last_updates if u.get('image') != image]
+    socketio.emit('check_complete', {
+        'updates': last_updates,
+        'timestamp': last_check_time.isoformat() if last_check_time else None
+    }, namespace='/')
+
+    logger.info(f"Dismissed pending downgrade for {image} -> {pending.get('tag')}")
+    return jsonify({'success': True})
 
 
 @app.route('/api/daemon', methods=['POST'])

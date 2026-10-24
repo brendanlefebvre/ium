@@ -272,6 +272,14 @@ function displayUpdates(updates) {
         const autoUpdateBadge = update.auto_update
             ? '<span class="badge badge-auto-update">Auto-update enabled</span>'
             : `<button class="btn btn-apply" data-image="${escapeHtml(update.image)}" data-new-tag="${escapeHtml(update.new_tag)}">Apply Update</button>`;
+        // A pending downgrade is never auto-applied; offer to ignore it
+        // until the registry resolves to a different digest.
+        const downgradeBadge = update.downgrade
+            ? ' <span class="badge badge-downgrade">Older than current</span>'
+            : '';
+        const dismissButton = update.downgrade
+            ? `<button class="btn btn-secondary btn-dismiss" data-image="${escapeHtml(update.image)}">Ignore until registry changes</button>`
+            : '';
 
         item.innerHTML = `
             <div class="update-item-header">
@@ -279,11 +287,11 @@ function displayUpdates(updates) {
                     <h3>${escapeHtml(update.image)}</h3>
                     <div class="update-details">
                         <span>Base tag: <strong>${escapeHtml(update.base_tag)}</strong></span>
-                        <span class="tag-change">${escapeHtml(update.old_tag)} → ${escapeHtml(update.new_tag)}</span>
+                        <span class="tag-change">${escapeHtml(update.old_tag)} → ${escapeHtml(update.new_tag)}</span>${downgradeBadge}
                         <span>Digest: ${escapeHtml(update.digest.substring(0, 12))}...</span>
                     </div>
                 </div>
-                <div>${autoUpdateBadge}</div>
+                <div class="card-actions">${autoUpdateBadge}${dismissButton}</div>
             </div>
             <div class="update-error" style="display:none"></div>
         `;
@@ -295,6 +303,52 @@ function displayUpdates(updates) {
     dom.updateList.querySelectorAll('.btn-apply').forEach(btn => {
         btn.addEventListener('click', () => applyUpdate(btn));
     });
+
+    // Wire up Dismiss buttons (pending downgrades only)
+    dom.updateList.querySelectorAll('.btn-dismiss').forEach(btn => {
+        btn.addEventListener('click', () => dismissUpdate(btn));
+    });
+}
+
+async function dismissUpdate(btn) {
+    const image = btn.dataset.image;
+    const item = btn.closest('.update-item');
+    const errorEl = item.querySelector('.update-error');
+
+    btn.disabled = true;
+    const originalText = btn.textContent;
+    btn.textContent = 'Ignoring…';
+    errorEl.style.display = 'none';
+
+    try {
+        const response = await fetch('/api/updates/dismiss', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+            body: JSON.stringify({ image })
+        });
+
+        const data = await response.json();
+
+        if (response.ok && data.success) {
+            item.remove();
+            if (!dom.updateList.querySelector('.update-item')) {
+                displayNoUpdates();
+            }
+            addLog(`Ignoring pending downgrade for ${image} until the registry changes`, 'info');
+        } else {
+            btn.textContent = originalText;
+            btn.disabled = false;
+            errorEl.textContent = data.error || 'Dismiss failed';
+            errorEl.style.display = 'block';
+            showToast(`Dismiss failed: ${data.error || 'unknown error'}`, 'error');
+        }
+    } catch (e) {
+        btn.textContent = originalText;
+        btn.disabled = false;
+        errorEl.textContent = 'Network error: ' + e.message;
+        errorEl.style.display = 'block';
+        showToast(`Dismiss failed: ${e.message}`, 'error');
+    }
 }
 
 async function applyUpdate(btn) {
