@@ -358,3 +358,89 @@ class TestSkipCheckById:
         assert not [c for c in calls if c[0] == 'POST'], (
             f'container was touched without knowing the target ID; calls were: {calls}'
         )
+
+
+class TestPortainerOrphanEndToEnd:
+    """The portainer regression, end to end over the fake socket.
+
+    The container was created from portainer/portainer-ce:2.45.0, whose tag
+    has since been re-pointed, so the container list reports a bare image ID
+    and the container's image carries no tags.  Saved state already names
+    the candidate.  Discovery, the current-tag lookup and the recreate all run
+    for real; only the registry resolve and the pull are patched.
+    """
+
+    IMAGE = 'portainer/portainer-ce'
+
+    @pytest.fixture
+    def portainer_updater(self, tmp_path):
+        from ium import ImageState
+        config_file = tmp_path / "config.json"
+        state_file = tmp_path / "state.json"
+        config_file.write_text(json.dumps({
+            "images": [{
+                "image": self.IMAGE,
+                "regex": r"^[0-9]+\.[0-9]+\.[0-9]+$",
+                "base_tag": "latest",
+                "auto_update": True,
+            }]
+        }))
+        state_file.write_text("{}")
+        u = DockerImageUpdater(str(config_file), str(state_file))
+        u.state[self.IMAGE] = ImageState(
+            base_tag='latest', tag='2.45.3', digest='sha256:old',
+            last_updated='2026-10-01T00:00:00')
+        return u
+
+    def _run(self, updater, target_images):
+        from urllib.parse import unquote
+
+        info = _skip_container_info(ID_A, 'running')
+        info['Id'] = 'c1'
+        info['Name'] = '/portainer'
+        info['Config']['Image'] = f'{self.IMAGE}:2.45.0'
+
+        def handler(method, url, body):
+            u = unquote(url)
+            if method == 'GET' and '/containers/json' in u:
+                return FakeResponse(200, json.dumps([{
+                    'Id': 'c1', 'Names': ['/portainer'],
+                    'Image': '3fe380ead685', 'State': 'running',
+                }]).encode())
+            if method == 'GET' and '/containers/portainer/json' in u:
+                return FakeResponse(200, json.dumps(info).encode())
+            if method == 'GET' and '/images/json' in u:
+                if f'"{self.IMAGE}:2.45.3"' in u:
+                    return FakeResponse(200, json.dumps(target_images).encode())
+                # Current-tag lookup: the orphaned image (ID_A) has no tags;
+                # only the target image is in the inventory.
+                return FakeResponse(200, json.dumps(
+                    [{'Id': ID_B, 'RepoTags': [f'{self.IMAGE}:2.45.3']}]).encode())
+            if method == 'POST' and '/containers/create' in u:
+                return FakeResponse(201, json.dumps({'Id': 'new123'}).encode())
+            return FakeResponse(204)
+
+        patcher, calls = fake_socket(handler)
+        with patcher, \
+             patch.object(updater, 'find_matching_tag', return_value=('2.45.3', 'sha256:new')), \
+             patch.object(updater, '_pull_image', return_value=True):
+            updates = updater.check_and_update()
+        creates = [u for m, u in calls if m == 'POST' and '/containers/create' in u]
+        stops = [u for m, u in calls if m == 'POST' and '/stop' in u]
+        return updates, creates, stops, calls
+
+    def test_orphan_is_recreated(self, portainer_updater):
+        updates, creates, stops, calls = self._run(portainer_updater, [{'Id': ID_B}])
+        assert creates, f'orphaned portainer was not recreated; calls were: {calls}'
+        assert updates[0]['old_tag'] == 'unknown'
+        state = portainer_updater._load_state()[self.IMAGE]
+        assert state.tag == '2.45.3'
+        assert state.digest == 'sha256:new'
+
+    def test_already_on_target_id_skips(self, portainer_updater):
+        updates, creates, stops, calls = self._run(portainer_updater, [{'Id': ID_A}])
+        assert not creates, f'container already on the target ID was recreated; calls were: {calls}'
+        assert not stops, f'container already on the target ID was stopped; calls were: {calls}'
+        state = portainer_updater._load_state()[self.IMAGE]
+        assert state.tag == '2.45.3'
+        assert state.digest == 'sha256:new'
