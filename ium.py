@@ -123,7 +123,7 @@ class ResolveFailure(Enum):
                        "or a release may be mid-publish")
     NO_FALLBACK_DIGEST = "Base tag does not exist and the newest matching tag could not be read"
     INTERNAL = "Internal error: regex not found in the compiled-pattern cache; re-save the config or restart ium"
-    REGEX_STALE = "latest is currently `{tags}`, which the regex `{regex}` does not match"
+    REGEX_STALE = "{base_tag} is currently `{tags}`, which the regex `{regex}` does not match"
     ROLLING_BASE = ("no tag names the current `{base_tag}` digest; it is probably a rolling build. "
                     "Try a release-line base tag (for example `v3`, `lts`, `stable`)")
 
@@ -523,7 +523,8 @@ class DockerImageUpdater:
         """Operator-facing text for ``failure``; formats the refined templates."""
         if failure is ResolveFailure.REGEX_STALE:
             tags = (rf.get('diag') or {}).get('sharing_tags') or []
-            return failure.value.format(tags=', '.join(tags), regex=regex)
+            return failure.value.format(tags=', '.join(tags), regex=regex,
+                                        base_tag=base_tag)
         if failure is ResolveFailure.ROLLING_BASE:
             return failure.value.format(base_tag=base_tag)
         return failure.value

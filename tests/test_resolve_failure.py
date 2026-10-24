@@ -432,7 +432,8 @@ def test_qbittorrent_regex_stale(updater):
     assert kw['new_version'] == 'latest'
     assert kw['digest'] == BASE_DIGEST
     assert kw['auto_update'] is True
-    refined = ResolveFailure.REGEX_STALE.value.format(tags=STALE_TAG, regex=REGEX)
+    refined = ResolveFailure.REGEX_STALE.value.format(
+        tags=STALE_TAG, regex=REGEX, base_tag="latest")
     assert events[0]['reason'] == 'regex_stale'
     assert refined in events[0]['error']
 
@@ -498,7 +499,8 @@ def test_refined_reason_persists_between_sweeps(updater):
 
     listing.assert_not_called()
     notify.assert_not_called()
-    refined = ResolveFailure.REGEX_STALE.value.format(tags=STALE_TAG, regex=REGEX)
+    refined = ResolveFailure.REGEX_STALE.value.format(
+        tags=STALE_TAG, regex=REGEX, base_tag="latest")
     assert refined in events[0]['error']
     assert events[0]['reason'] == 'regex_stale'
 
@@ -607,7 +609,8 @@ def test_a_send_delays_first_b_send(updater):
 
     assert [h for h, s in sends.items() if s] == [3, 27]
     assert len(sends[3]) == 1 and len(sends[27]) == 1
-    refined = ResolveFailure.REGEX_STALE.value.format(tags=STALE_TAG, regex=REGEX)
+    refined = ResolveFailure.REGEX_STALE.value.format(
+        tags=STALE_TAG, regex=REGEX, base_tag="latest")
     assert f"{refined}. Failing since" in sends[27][0].kwargs['message']
     rf = _reload(updater).resolve_failure
     assert rf['last_notified'] == (NOW + timedelta(hours=27)).isoformat()

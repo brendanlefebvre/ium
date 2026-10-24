@@ -518,8 +518,8 @@ class TestResolveFailureReason:
     def test_refined_members_are_format_templates(self):
         # A later task formats these; the plain members carry no placeholders.
         assert ResolveFailure.REGEX_STALE.value.format(
-            tags="v1, v2", regex="^x$") == (
-            "latest is currently `v1, v2`, which the regex `^x$` does not match")
+            tags="v1, v2", regex="^x$", base_tag="stable") == (
+            "stable is currently `v1, v2`, which the regex `^x$` does not match")
         assert ResolveFailure.ROLLING_BASE.value.format(base_tag="latest") == (
             "no tag names the current `latest` digest; it is probably a "
             "rolling build. Try a release-line base tag (for example `v3`, "
