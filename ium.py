@@ -26,6 +26,7 @@ from enum import Enum
 import argparse
 import os
 import platform
+from urllib.parse import urljoin
 import requests
 import jsonschema
 
@@ -62,6 +63,9 @@ DEFAULT_REQUEST_TIMEOUT = 60
 
 # Registry (HTTPS) request timeout — unrelated to the Docker socket budget above.
 REGISTRY_REQUEST_TIMEOUT = 30
+
+# Upper bound on Link-header pages followed when listing a repository's tags.
+MAX_TAG_PAGES = 50
 
 # A pending (refused) downgrade is notified on first detection, then at most
 # once per this interval; it is re-reported to the UI every cycle regardless.
@@ -283,6 +287,24 @@ class AuthManager:
                     "  Set WEBUI_USER and WEBUI_PASSWORD to avoid regeneration on restart.",
                     self.user, self.password
                 )
+
+
+def _next_link(link_header: Optional[str], base: str) -> Optional[str]:
+    """Return the ``rel="next"`` URL from an RFC 5988 Link header, or None.
+
+    Relative targets (ghcr.io sends ``/v2/...?last=x&n=0``) are resolved
+    against ``base``; the query string is passed through untouched.
+    """
+    if not link_header:
+        return None
+    for part in link_header.split(','):
+        target, _, params = part.partition(';')
+        target = target.strip()
+        if not (target.startswith('<') and target.endswith('>')):
+            continue
+        if re.search(r'rel\s*=\s*"?next"?(?:[\s;]|$)', params, re.IGNORECASE):
+            return urljoin(base, target[1:-1])
+    return None
 
 
 @dataclass
@@ -775,9 +797,20 @@ class DockerImageUpdater:
             headers['Authorization'] = f'Bearer {token}'
 
         try:
-            response = self._request_with_retry('GET', tags_url, headers=headers)
-            response.raise_for_status()
-            return response.json().get('tags') or []
+            tags: List[str] = []
+            url: Optional[str] = tags_url
+            pages = 0
+            while url and pages < MAX_TAG_PAGES:
+                response = self._request_with_retry('GET', url, headers=headers)
+                response.raise_for_status()
+                tags.extend(response.json().get('tags') or [])
+                url = _next_link(response.headers.get('Link'), base=f"https://{registry}")
+                pages += 1
+            if url:
+                self.logger.warning(
+                    f"Tag list for {namespace}/{repo} truncated at {MAX_TAG_PAGES} pages"
+                )
+            return tags
         except requests.RequestException as e:
             self.logger.error(f"Error getting tags for {namespace}/{repo}: {e}")
             return []
