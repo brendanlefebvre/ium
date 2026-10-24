@@ -613,6 +613,30 @@ class TestApplyUpdate:
         assert resp.status_code == 500
         assert 'error' in resp.get_json()
 
+    def test_apply_update_docker_unreachable(self, app_client, monkeypatch):
+        """Returns 503 and leaves state untouched when containers cannot be listed."""
+        import webui as webui_mod
+        from docker_api import DockerAPIError
+
+        monkeypatch.setattr(webui_mod, 'last_updates', [{
+            'image': 'nginx', 'base_tag': 'latest',
+            'old_tag': '1.26.0', 'new_tag': '1.27.0',
+            'digest': 'sha256:abc', 'auto_update': False
+        }])
+        monkeypatch.setattr(webui_mod.updater, '_pull_image', MagicMock(return_value=True))
+        monkeypatch.setattr(webui_mod.updater, '_get_containers_for_image',
+                            MagicMock(side_effect=DockerAPIError(0, "boom")))
+        mock_update_containers = MagicMock()
+        monkeypatch.setattr(webui_mod.updater, '_update_containers', mock_update_containers)
+
+        resp = _post_json(app_client, '/api/apply-update', {
+            'image': 'nginx', 'new_tag': '1.27.0'
+        })
+        assert resp.status_code == 503
+        assert 'unreachable' in resp.get_json()['error']
+        mock_update_containers.assert_not_called()
+        assert 'nginx' not in webui_mod.updater.state
+
     def test_apply_update_requires_csrf(self, app_client):
         """Rejects request without CSRF header."""
         resp = app_client.post('/api/apply-update',

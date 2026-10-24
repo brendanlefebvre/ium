@@ -172,12 +172,73 @@ class TestGetContainersForImage:
             assert len(containers) == 1
             assert containers[0]['name'] == 'sonarr'
 
-    def test_docker_api_failure(self, updater):
-        """Test handling of Docker API failure."""
+
+
+class TestDiscoveryFailureDefers:
+    """A container-list failure defers the image instead of recording success."""
+
+    SEED_DIGEST = 'sha256:old'
+
+    @pytest.fixture
+    def updater(self, tmp_path):
+        config_file = tmp_path / "config.json"
+        state_file = tmp_path / "state.json"
+        config_file.write_text(json.dumps({
+            "images": [{
+                "image": "linuxserver/sonarr",
+                "regex": r"^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+-ls[0-9]+$",
+                "auto_update": True,
+            }]
+        }))
+        state_file.write_text(json.dumps({
+            "linuxserver/sonarr": {
+                "base_tag": "latest",
+                "tag": "4.0.0.740-ls1",
+                "digest": self.SEED_DIGEST,
+                "last_updated": "2026-10-01T00:00:00",
+            }
+        }))
+        return DockerImageUpdater(str(config_file), str(state_file))
+
+    def test_list_error_raises(self, updater):
         with patch.object(updater.docker, 'list_containers',
-                          side_effect=DockerAPIError(500, "Internal Server Error")):
-            containers = updater._get_containers_for_image("nginx")
-            assert containers == []
+                          side_effect=DockerAPIError(0, "boom")):
+            with pytest.raises(DockerAPIError):
+                updater._get_containers_for_image("linuxserver/sonarr")
+
+    def test_list_error_skips_image(self, updater):
+        events = []
+        with patch.object(updater, 'find_matching_tag',
+                          return_value=('4.0.1.100-ls1', 'sha256:new')), \
+             patch.object(updater.docker, 'list_containers',
+                          side_effect=DockerAPIError(0, "boom")), \
+             patch.object(updater, '_pull_image', return_value=True) as mock_pull:
+            updates = updater.check_and_update(
+                progress_callback=lambda e, d: events.append((e, d)))
+
+        assert mock_pull.call_count == 0
+        assert updates == []
+        saved = updater.state['linuxserver/sonarr']
+        assert saved.digest == self.SEED_DIGEST
+        assert saved.tag == '4.0.0.740-ls1'
+        errors = [d for e, d in events if e == 'check_error']
+        assert len(errors) == 1
+        assert errors[0]['reason'] == 'docker_unreachable'
+        assert errors[0]['image'] == 'linuxserver/sonarr'
+        assert not any(e == 'update_found' for e, _ in events)
+
+    def test_unchanged_digest_makes_no_docker_call(self, updater):
+        events = []
+        with patch.object(updater, 'find_matching_tag',
+                          return_value=('4.0.0.740-ls1', self.SEED_DIGEST)), \
+             patch.object(updater.docker, 'list_containers') as mock_list, \
+             patch.object(updater, '_pull_image', return_value=True) as mock_pull:
+            updater.check_and_update(
+                progress_callback=lambda e, d: events.append((e, d)))
+
+        mock_list.assert_not_called()
+        assert mock_pull.call_count == 0
+        assert any(e == 'no_update' for e, _ in events)
 
 
 class TestUpdateContainers:

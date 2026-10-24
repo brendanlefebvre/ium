@@ -22,6 +22,7 @@ import jsonschema
 from flask import Flask, render_template, jsonify, request, Response
 from flask_socketio import SocketIO, emit
 
+from docker_api import DockerAPIError
 from ium import DockerImageUpdater, CONFIG_SCHEMA, __version__, _validate_regex, AuthManager, ImageState
 from notify import send_ntfy, send_webhook, _build_payload
 from pattern_utils import detect_tag_patterns, detect_base_tags
@@ -471,7 +472,13 @@ def api_apply_update():
             return jsonify({'error': f'Failed to pull {image}:{new_tag}'}), 500
 
         # Discover and update containers
-        containers = updater._get_containers_for_image(image)
+        try:
+            containers = updater._get_containers_for_image(image)
+        except DockerAPIError as e:
+            logger.warning(f"apply-update: could not list containers for {image}: {e}")
+            return jsonify({
+                'error': f"Docker daemon unreachable while listing containers for {image}: {e}"
+            }), 503
         if containers:
             container_names = [c['name'] for c in containers]
             results = updater._update_containers(container_names, image, new_tag, registry)

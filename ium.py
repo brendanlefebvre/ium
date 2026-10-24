@@ -968,7 +968,12 @@ class DockerImageUpdater:
         """Get all containers (running or stopped) using a specific image.
 
         Returns:
-            List of dicts with keys: name, id, state, image_ref
+            List of dicts with keys: name, id, state, image_ref. An empty list
+            means discovery succeeded and no container uses the image.
+
+        Raises:
+            DockerAPIError: the container list could not be fetched; callers
+                must not treat this as "no containers".
         """
         try:
             api_containers = self.docker.list_containers(all=True)
@@ -1001,7 +1006,7 @@ class DockerImageUpdater:
 
         except DockerAPIError as e:
             self.logger.error(f"Failed to list containers: {e}")
-            return []
+            raise
 
     @staticmethod
     def _normalize_image_ref(img: str) -> str:
@@ -1608,10 +1613,26 @@ class DockerImageUpdater:
             # Check if this is different from our saved state
             saved_state = self.state.get(image)
 
-            # Discover all containers using this image
-            containers = self._get_containers_for_image(image)
-
             if not saved_state or saved_state.digest != digest:
+                # Discover all containers using this image.  Done only when
+                # the registry has moved, so an unchanged image makes no
+                # Docker call.  A list failure defers the image to the next
+                # cycle before any pull, notification, or state write.
+                try:
+                    containers = self._get_containers_for_image(image)
+                except DockerAPIError as e:
+                    self.logger.warning(
+                        f"Could not list containers for {image} ({e}); "
+                        f"skipping this cycle so the update is retried"
+                    )
+                    if progress_callback:
+                        progress_callback('check_error', {
+                            'image': image, 'base_tag': base_tag,
+                            'reason': 'docker_unreachable',
+                            'error': f"Docker daemon unreachable while listing containers for {image}: {e}",
+                        })
+                    continue
+
                 # Determine current version (from saved state or first container)
                 old_tag = saved_state.tag if saved_state else None
                 if not old_tag and containers:
