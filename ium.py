@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 from pathlib import Path
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 from contextlib import contextmanager
 from enum import Enum
 import argparse
@@ -71,6 +71,13 @@ MAX_TAG_PAGES = 50
 # once per this interval; it is re-reported to the UI every cycle regardless.
 DOWNGRADE_RENOTIFY_INTERVAL = timedelta(hours=24)
 
+# Resolver failure escalation (spec §7.4): silent for the first day of a
+# streak, then at most daily through day 7, then at most weekly.
+RESOLVE_FAILURE_FIRST_NOTIFY = timedelta(hours=24)
+RESOLVE_FAILURE_DAILY = timedelta(hours=24)
+RESOLVE_FAILURE_WEEKLY_AFTER = timedelta(days=7)
+RESOLVE_FAILURE_WEEKLY = timedelta(days=7)
+
 # Container states that mean "not running", so an update may safely continue
 # after a stop request failed.  'paused' is deliberately excluded: a paused
 # container still holds its processes.
@@ -112,6 +119,28 @@ class ResolveFailure(Enum):
     REGEX_STALE = "latest is currently `{tags}`, which the regex `{regex}` does not match"
     ROLLING_BASE = ("no tag names the current `{base_tag}` digest; it is probably a rolling build. "
                     "Try a release-line base tag (for example `v3`, `lts`, `stable`)")
+
+
+def _parse_iso(value: Any) -> Optional[datetime]:
+    """Parse an ISO timestamp from state; ``None`` if missing or malformed."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_duration(delta: timedelta) -> str:
+    """Coarse human duration: ``'3d 4h'``, ``'5h 12m'``, ``'7m'``."""
+    total_minutes = max(0, int(delta.total_seconds() // 60))
+    days, rem = divmod(total_minutes, 24 * 60)
+    hours, minutes = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
 
 
 def _natural_sort_key(tag: str) -> tuple:
@@ -417,6 +446,111 @@ class DockerImageUpdater:
             base_tag=base_tag, tag=tag, digest=digest,
             last_updated=last_updated, pending=pending,
         )
+
+    def _write_resolve_failure(self, image: str, saved_state: Optional['ImageState'],
+                               base_tag: str, rf: Dict[str, Any]) -> None:
+        """Record the failure streak ``rf`` without touching anything else.
+
+        Preserves the saved tag/digest/last_updated/pending.  An image that
+        has never resolved gets the placeholder ``tag='unknown', digest=''``
+        (spec §7.1), so its first success takes the normal path because
+        ``'' != digest``.  Only updates ``self.state``; the end-of-cycle
+        ``_save_state`` persists it (and skips the write in dry run).
+        """
+        if saved_state:
+            self.state[image] = replace(saved_state, resolve_failure=rf)
+        else:
+            self.state[image] = ImageState(
+                base_tag=base_tag, tag='unknown', digest='',
+                last_updated=self._now().isoformat(), resolve_failure=rf,
+            )
+
+    def _clear_resolve_failure(self, image: str, saved_state: 'ImageState',
+                               matching_tag: str, digest: str,
+                               image_config: Dict[str, Any]) -> None:
+        """End a failure streak: drop the record, log, notify if one was sent.
+
+        Runs on every successful resolve that finds a record, before any of
+        the success path's ``continue``s, and regardless of ``auto_update``
+        or whether the digest changed (spec §7.2).
+        """
+        rf = saved_state.resolve_failure or {}
+        self.state[image] = replace(saved_state, resolve_failure=None)
+        since = _parse_iso(rf.get('since'))
+        duration = _format_duration(self._now() - since) if since else 'an unknown time'
+        self.logger.info(f"RESOLVED AGAIN: {image} after {duration}")
+        if rf.get('last_notified') is not None:
+            send_notifications(
+                self.config.get('notifications'),
+                image=image, old_version=saved_state.tag, new_version=matching_tag,
+                event='resolve_recovered', digest=digest,
+                auto_update=image_config.get('auto_update', False),
+                message=(f"{image} resolves again: {matching_tag} "
+                         f"(after failing for {duration})."),
+            )
+
+    def _effective_failure(self, failure: ResolveFailure, rf: Dict[str, Any],
+                           base_digest: Optional[str]) -> ResolveFailure:
+        """The failure surfaced to the operator this cycle.
+
+        Seam for the §7.3 diagnosis (Task 14): a current ``regex_stale`` /
+        ``rolling_base`` finding in ``rf['diag']`` refines ``NO_DIGEST_MATCH``.
+        For now the raw failure is surfaced unchanged.
+        """
+        return failure
+
+    def _maybe_diagnose(self, image: str, base_tag: str, regex: str,
+                        registry: Optional[str], failure: ResolveFailure,
+                        rf: Dict[str, Any], base_digest: Optional[str],
+                        image_config: Dict[str, Any]) -> None:
+        """Seam for the §7.3 diagnosis sweep (Task 14); a no-op for now.
+
+        Runs after streak bookkeeping and before the §7.4 escalation, and
+        may store ``rf['diag']`` and set ``rf['last_notified']``.
+        """
+        return None
+
+    def _escalate_resolve_failure(self, image: str, base_tag: str, rf: Dict[str, Any],
+                                  failure_text: str, image_config: Dict[str, Any]) -> None:
+        """Send ``resolve_failure`` per the §7.4 schedule; sets ``last_notified``.
+
+        Nothing before 24 h of continuous failure, then at most daily until
+        day 7, then at most weekly.
+        """
+        now = self._now()
+        since = _parse_iso(rf.get('since'))
+        if since is None:
+            # Corrupt record: restart the streak clock rather than crash.
+            rf['since'] = now.isoformat()
+            return
+        age = now - since
+        last_notified = _parse_iso(rf.get('last_notified'))
+        gap = (now - last_notified) if last_notified else None  # None: infinite
+
+        if age < RESOLVE_FAILURE_FIRST_NOTIFY:
+            return
+        # Exactly day 7 is still in the daily band, so the week's seventh
+        # reminder lands at 7 d and the first weekly one at 14 d (§7.7).
+        interval = (RESOLVE_FAILURE_DAILY if age <= RESOLVE_FAILURE_WEEKLY_AFTER
+                    else RESOLVE_FAILURE_WEEKLY)
+        if gap is not None and gap < interval:
+            return
+
+        saved_state = self.state.get(image)
+        current_tag = saved_state.tag if saved_state else 'unknown'
+        message = (
+            f"{image} cannot resolve {base_tag}: {failure_text} "
+            f"Failing since {since.strftime('%Y-%m-%d %H:%M')} "
+            f"({_format_duration(age)}, {rf.get('cycles')} cycles)."
+        )
+        send_notifications(
+            self.config.get('notifications'),
+            image=image, old_version=current_tag, new_version=base_tag,
+            event='resolve_failure', digest=self._last_base_digest or '',
+            auto_update=image_config.get('auto_update', False),
+            message=message,
+        )
+        rf['last_notified'] = now.isoformat()
 
     def _setup_logging(self, level: str) -> logging.Logger:
         """Setup logging configuration."""
@@ -1757,29 +1891,59 @@ class DockerImageUpdater:
             
             # Find matching tag for current base tag
             result = self.find_matching_tag(image, base_tag, regex, registry)
+            saved_state = self.state.get(image)
 
             if not result:
                 # Defensive: every failing branch records a reason, so None
                 # here would be a bug; still say something rather than crash.
                 failure = self._last_resolve_failure or ResolveFailure.INTERNAL
-                message = f"Could not determine version for {image}:{base_tag}: {failure.value}"
+                base_digest = self._last_base_digest
+
+                # Streak bookkeeping (spec §7.2).  Copy so the saved record
+                # is only replaced via _write_resolve_failure.
+                rf = dict((saved_state.resolve_failure if saved_state else None) or {})
+                if not rf:
+                    rf = {'reason': failure.name, 'since': self._now().isoformat(),
+                          'cycles': 0, 'last_notified': None}
+                rf['reason'] = failure.name  # may change mid-streak; `since` does not
+                rf['cycles'] = rf.get('cycles', 0) + 1
+
+                # Diagnosis (spec §7.3, Task 14) slots in here.
+                self._maybe_diagnose(image, base_tag, regex, registry, failure,
+                                     rf, base_digest, image_config)
+                shown = self._effective_failure(failure, rf, base_digest)
+
+                message = f"Could not determine version for {image}:{base_tag}: {shown.value}"
                 self.logger.warning(message)
                 if progress_callback:
-                    progress_callback('check_error', {
+                    payload = {
                         'image': image,
                         'base_tag': base_tag,
-                        'reason': failure.name.lower(),
+                        'reason': shown.name.lower(),
                         'error': message,
-                    })
+                    }
+                    if rf['cycles'] >= 2:
+                        payload['failing_since'] = rf['since']
+                        payload['failing_cycles'] = rf['cycles']
+                    progress_callback('check_error', payload)
+
+                self._escalate_resolve_failure(image, base_tag, rf, shown.value, image_config)
+                # Persist every failing cycle (the counter changes).
+                self._write_resolve_failure(image, saved_state, base_tag, rf)
                 continue
 
             matching_tag, digest = result
             self.logger.info(f"Base tag '{base_tag}' corresponds to: {matching_tag}")
             self.logger.debug(f"Digest: {digest}")
 
-            # Check if this is different from our saved state
-            saved_state = self.state.get(image)
+            # A streak ends on any successful resolve, before any of the
+            # `continue`s below and regardless of auto_update or digest.
+            if saved_state and saved_state.resolve_failure:
+                self._clear_resolve_failure(image, saved_state, matching_tag,
+                                            digest, image_config)
+                saved_state = self.state[image]
 
+            # Check if this is different from our saved state
             if not saved_state or saved_state.digest != digest:
                 # Discover all containers using this image.  Done only when
                 # the registry has moved, so an unchanged image makes no
@@ -2024,6 +2188,15 @@ class DockerImageUpdater:
                         )
             else:
                 self.logger.info("No update available")
+                # Upstream reverted the base tag to the saved digest: the
+                # downgrade code never runs on this path, so a refused
+                # downgrade record would otherwise persist forever.
+                if saved_state.pending and saved_state.pending.get('reason') == 'downgrade':
+                    self.logger.info(
+                        f"Clearing pending downgrade for {image} "
+                        f"({saved_state.pending.get('tag')}): registry is back on {matching_tag}"
+                    )
+                    self.state[image] = replace(saved_state, pending=None)
                 # Emit progress: no update
                 if progress_callback:
                     progress_callback('no_update', {

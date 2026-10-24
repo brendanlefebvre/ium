@@ -223,3 +223,45 @@ def test_state_round_trip(updater):
 
     assert asdict(first) == asdict(second)
     assert second.pending == _downgrade_pending()
+
+
+def test_upstream_revert_clears_stale_downgrade_pending(updater):
+    """Upstream reverts the base tag to the saved digest: the unchanged-digest
+    path never reaches the downgrade code, so it must drop the stale record."""
+    _seed(updater, pending=_downgrade_pending())
+    updates, notify, upd, _ = _run(updater, candidate=(CURRENT, CURRENT_DIGEST),
+                                   now=NOW + timedelta(hours=3))
+
+    assert updates == []
+    notify.assert_not_called()
+    upd.assert_not_called()
+    state = _reload(updater)
+    assert state.pending is None
+    assert state.tag == CURRENT
+    assert state.digest == CURRENT_DIGEST
+    assert state.last_updated == '2026-10-01T00:00:00'
+
+
+def test_sonarr_two_cycle_regression(updater):
+    """The production sonarr chain: ls1 refused, then ls1 re-pushed with a new
+    digest.  Must stay refused with state still on the ls329-era tag."""
+    _seed(updater)
+    _, _, upd1, _ = _run(updater)
+    state = _reload(updater)
+    assert state.tag == CURRENT
+    assert state.pending['digest'] == DOWN_DIGEST
+
+    later = NOW + timedelta(hours=1)
+    d1_prime = 'sha256:d1prime'
+    updates, _, upd2, pull2 = _run(updater, candidate=(DOWN, d1_prime), now=later)
+
+    upd1.assert_not_called()
+    upd2.assert_not_called()
+    pull2.assert_not_called()
+    assert updates[0]['downgrade'] is True
+    state = _reload(updater)
+    assert state.tag == CURRENT
+    assert state.digest == CURRENT_DIGEST
+    assert state.pending['tag'] == DOWN
+    assert state.pending['digest'] == d1_prime
+    assert state.pending['first_seen'] == later.isoformat()
