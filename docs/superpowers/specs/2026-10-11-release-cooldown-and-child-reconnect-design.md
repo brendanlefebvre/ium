@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-11
 **Status:** Approved
-**Target version:** 1.5.0
+**Target version:** 1.6.0 (retargeted 2026-10-24; 1.5.0 became the orphaned-image / blocked-downgrade release, see `2026-10-24-orphaned-image-and-blocked-downgrade-design.md`, which also introduces the `pending` state field this spec extends with `reason: "cooldown"`)
 
 ## Background
 
@@ -85,7 +85,7 @@ class ImageState:
   `datetime.now(timezone.utc).isoformat()`. UTC is deliberate: the age
   computation must not shift by an hour across DST.
 - `_load_state` constructs `ImageState(**image_data)`; the default makes
-  state files written before 1.5.0 load unchanged. `_save_state` uses
+  state files written before 1.6.0 load unchanged. `_save_state` uses
   `asdict`, which serialises the nested dict as-is. No migration step.
 - `pending` is only ever set while an auto-update is deferred. It is cleared
   (the whole `ImageState` is rewritten without it) whenever `state.tag`
@@ -380,14 +380,14 @@ Either way the final restart must succeed. A failure here blocks the release.
 The two parts are independent and may be built in either order or in
 parallel. Within Part 2 the order is fixed: 2.2 (refactor, full suite green,
 no test edits) **before** 2.3 (new behaviour). Within Part 1, do 1.2 (state)
-before 1.3 (flow), and 1.3 before 1.4/1.5. Bump `__version__` to `1.5.0` last.
+before 1.3 (flow), and 1.3 before 1.4/1.5. Bump `__version__` to `1.6.0` last.
 
 ## Compatibility
 
 - Config files without `min_release_age_hours` validate and behave as before.
 - State files without `pending` load as before. A state file written by
-  1.5.0 and read by an older ium would fail `ImageState(**data)` on the
-  unknown key; downgrading past 1.5.0 therefore requires deleting the
+  1.6.0 and read by an older ium would fail `ImageState(**data)` on the
+  unknown key; downgrading past 1.6.0 therefore requires deleting the
   `pending` keys from `state/image_update_state.json`. Note this in the
   release notes.
 - Notification payloads are unchanged unless an update is deferred.
