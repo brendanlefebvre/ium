@@ -212,7 +212,13 @@ function handleCheckProgress(data) {
             addLog(`  - No update available`, 'info');
             break;
         case 'check_error':
-            addLog(`  ✗ ${eventData.error}`, 'error');
+            {
+                let line = `  ✗ ${eventData.error}`;
+                if (eventData.failing_since) {
+                    line += ` (failing since ${new Date(eventData.failing_since).toLocaleDateString()}, ${eventData.failing_cycles} cycles)`;
+                }
+                addLog(line, 'error');
+            }
             break;
     }
 }
