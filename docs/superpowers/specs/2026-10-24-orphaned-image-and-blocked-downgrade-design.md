@@ -556,7 +556,7 @@ base digest. Exclude `base_tag` itself. Outcome:
 | Finding | `outcome` | Refined failure shown to the operator |
 |---|---|---|
 | Some sharing tag matches the regex | `transient` | Unchanged `NO_DIGEST_MATCH`; the earlier miss was a per-tag error. No notification from A. |
-| Sharing tags exist, none match the regex | `regex_stale` | New member `ResolveFailure.REGEX_STALE`: "latest is currently `{tags}`, which the regex `{regex}` does not match". |
+| Sharing tags exist, none match the regex | `regex_stale` | New member `ResolveFailure.REGEX_STALE`: "`{base_tag}` is currently `{tags}`, which the regex `{regex}` does not match". |
 | No tag shares the digest | `rolling_base` | New member `ResolveFailure.ROLLING_BASE`: "no tag names the current `{base_tag}` digest; it is probably a rolling build. Try a release-line base tag (for example `v3`, `lts`, `stable`)". |
 
 Store `diag` on `rf`. **Which reason is surfaced each cycle:** 7.2 writes
