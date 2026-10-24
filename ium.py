@@ -1171,12 +1171,27 @@ class DockerImageUpdater:
         if not container_info:
             return False
 
-        # Skip if already running the target image (e.g. retry after partial failure)
-        current_image = container_info.get('Config', {}).get('Image', '')
-        if current_image == full_image:
+        # Skip if already on the target image (e.g. retry after partial failure).
+        # Compare image IDs, not reference strings: after a same-tag re-push
+        # Config.Image still equals full_image while the container sits on the
+        # old image, and a string match would skip the update forever.
+        try:
+            target = self.docker.list_images(full_image)  # reference filter: exact repo:tag
+        except DockerAPIError as e:
+            self.logger.error(
+                f"Could not look up local image {full_image} for "
+                f"{container_name}: {e.message}"
+            )
+            return False
+        target_id = target[0].get('Id', '') if target else ''
+        current_id = container_info.get('Image', '')
+        if target_id and current_id == target_id:
             status = (container_info.get('State') or {}).get('Status', '')
             if status == 'running':
-                self.logger.info(f"Container {container_name} already running {full_image}, skipping")
+                self.logger.info(
+                    f"Container {container_name} already running {full_image} "
+                    f"({target_id[:19]}), skipping"
+                )
                 return True
 
             # On the target image but not running: a previous update was

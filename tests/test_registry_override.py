@@ -60,6 +60,7 @@ class TestUpdateContainerImageReference:
             patch.object(updater.docker, "create_container", return_value="newid"),
             patch.object(updater.docker, "start_container"),
             patch.object(updater.docker, "remove_container"),
+            patch.object(updater.docker, "list_images", return_value=[]),
         ]
 
     def test_registry_override_prefixes_image(self, ghcr_updater):
@@ -70,7 +71,7 @@ class TestUpdateContainerImageReference:
         """
         captured = []
         patches = self._patch_docker_ops(ghcr_updater, captured)
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7]:
             result = ghcr_updater._update_container(
                 "homarr", "homarr-labs/homarr", "v1.9.0", registry="ghcr.io"
             )
@@ -82,7 +83,7 @@ class TestUpdateContainerImageReference:
         """Without a registry override the image reference is unchanged."""
         captured = []
         patches = self._patch_docker_ops(ghcr_updater, captured)
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7]:
             result = ghcr_updater._update_container(
                 "sonarr", "linuxserver/sonarr", "4.0.16.2944-ls299"
             )
@@ -94,7 +95,7 @@ class TestUpdateContainerImageReference:
         """Image already containing the registry host must not be double-prefixed."""
         captured = []
         patches = self._patch_docker_ops(ghcr_updater, captured)
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7]:
             result = ghcr_updater._update_container(
                 "homarr", "ghcr.io/homarr-labs/homarr", "v1.9.0", registry="ghcr.io"
             )

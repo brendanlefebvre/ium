@@ -4,6 +4,7 @@ import json
 import pytest
 from unittest.mock import Mock, patch, call
 from ium import DEFAULT_REQUEST_TIMEOUT, DEFAULT_STOP_TIMEOUT, DockerImageUpdater
+from tests.fake_docker import FakeResponse, fake_socket
 
 
 @pytest.fixture
@@ -197,10 +198,12 @@ class TestSkipAlreadyUpdated:
     def test_skip_container_already_on_target_image(self, updater):
         """A container already running the target image is skipped (returns True)."""
         container_info = {
+            'Image': 'sha256:' + 'a' * 64,
             'Config': {'Image': 'linuxserver/sonarr:4.0.16.2944-ls299'},
             'State': {'Status': 'running'},
         }
         with patch.object(updater, '_get_container_config', return_value=container_info), \
+             patch.object(updater.docker, 'list_images', return_value=[{'Id': 'sha256:' + 'a' * 64}]), \
              patch.object(updater.docker, 'stop_container') as mock_stop:
 
             result = updater._update_container('sonarr', 'linuxserver/sonarr', '4.0.16.2944-ls299')
@@ -230,6 +233,7 @@ class TestSkipAlreadyUpdated:
             'NetworkSettings': {'Networks': {}},
         }
         with patch.object(updater, '_get_container_config', return_value=container_info), \
+             patch.object(updater.docker, 'list_images', return_value=[]), \
              patch.object(updater.docker, 'stop_container'), \
              patch.object(updater.docker, 'rename_container'), \
              patch.object(updater.docker, 'create_container', return_value='new123'), \
@@ -238,3 +242,119 @@ class TestSkipAlreadyUpdated:
 
             result = updater._update_container('sonarr', 'linuxserver/sonarr', '4.0.16.2944-ls299')
             assert result is True
+
+
+# ---------------------------------------------------------------------------
+# Spec Part 3: the skip check compares image IDs, not reference strings
+# ---------------------------------------------------------------------------
+
+SKIP_TARGET_TAG = '4.0.16.2944-ls299'
+SKIP_TARGET_IMAGE = f'linuxserver/sonarr:{SKIP_TARGET_TAG}'
+ID_A = 'sha256:' + 'a' * 64
+ID_B = 'sha256:' + 'b' * 64
+
+
+def _skip_container_info(image_id: str, status: str) -> dict:
+    """A container whose Config.Image string already equals the target."""
+    return {
+        'Id': 'abc123' * 10,
+        'Image': image_id,
+        'Config': {
+            'Image': SKIP_TARGET_IMAGE,
+            'Hostname': 'abc123abc1',
+            'User': '', 'WorkingDir': '',
+            'Env': ['PATH=/usr/bin:/bin'],
+            'Cmd': None, 'Labels': {},
+        },
+        'HostConfig': {
+            'RestartPolicy': {'Name': '', 'MaximumRetryCount': 0},
+            'NetworkMode': 'default',
+            'PortBindings': None,
+            'Privileged': False, 'CapAdd': None, 'CapDrop': None,
+            'Devices': None, 'Memory': 0, 'CpuShares': 0,
+            'CpuQuota': 0, 'SecurityOpt': None, 'Runtime': '',
+        },
+        'Mounts': [],
+        'NetworkSettings': {'Networks': {}},
+        'State': {'Status': status},
+    }
+
+
+class TestSkipCheckById:
+    """Skip only when the container is on the image ID the target tag resolves to.
+
+    Runs the real DockerClient request path over a fake socket.
+    """
+
+    @staticmethod
+    def _run(updater, container_info, local_images):
+        def handler(method, url, body):
+            if method == 'GET' and '/containers/sonarr/json' in url:
+                return FakeResponse(200, json.dumps(container_info).encode())
+            if method == 'GET' and '/images/json' in url:
+                return FakeResponse(200, json.dumps(local_images).encode())
+            if method == 'POST' and '/containers/create' in url:
+                return FakeResponse(201, json.dumps({'Id': 'new123'}).encode())
+            return FakeResponse(204)
+
+        patcher, calls = fake_socket(handler)
+        with patcher:
+            result = updater._update_container('sonarr', 'linuxserver/sonarr', SKIP_TARGET_TAG)
+        creates = [u for m, u in calls if m == 'POST' and '/containers/create' in u]
+        starts = [u for m, u in calls if m == 'POST' and u.endswith('/containers/sonarr/start')]
+        stops = [u for m, u in calls if m == 'POST' and '/containers/sonarr/stop' in u]
+        lookups = [u for m, u in calls if m == 'GET' and '/images/json' in u]
+        return result, creates, starts, stops, lookups, calls
+
+    def test_same_id_running_skips(self, updater):
+        result, creates, starts, stops, lookups, calls = self._run(
+            updater, _skip_container_info(ID_A, 'running'), [{'Id': ID_A}])
+        assert result is True
+        assert lookups, f'target image ID was never looked up; calls were: {calls}'
+        assert not creates, f'a container on the target ID was recreated; calls were: {calls}'
+        assert not stops and not starts, f'a healthy container was touched; calls were: {calls}'
+
+    def test_same_id_exited_starts(self, updater):
+        result, creates, starts, stops, lookups, calls = self._run(
+            updater, _skip_container_info(ID_A, 'exited'), [{'Id': ID_A}])
+        assert result is True
+        assert starts, f'exited container on the target ID was not started; calls were: {calls}'
+        assert not creates, f'exited container on the target ID was recreated; calls were: {calls}'
+        assert not stops, f'exited container was stopped; calls were: {calls}'
+
+    def test_different_id_recreates(self, updater):
+        """Regression: Config.Image equals the target string, but the tag was re-pushed.
+
+        The string check said "already running" while the container sat on an
+        older image ID, so same-tag re-pushes were never applied.
+        """
+        result, creates, starts, stops, lookups, calls = self._run(
+            updater, _skip_container_info(ID_A, 'running'), [{'Id': ID_B}])
+        assert creates, (
+            f'container on a stale image ID was skipped instead of recreated; calls were: {calls}'
+        )
+
+    def test_missing_local_tag_recreates(self, updater):
+        result, creates, starts, stops, lookups, calls = self._run(
+            updater, _skip_container_info(ID_A, 'running'), [])
+        assert lookups, f'target image ID was never looked up; calls were: {calls}'
+        assert creates, (
+            f'an unresolvable target tag must not be treated as already running; calls were: {calls}'
+        )
+
+    def test_image_lookup_failure_touches_nothing(self, updater):
+        """If the target ID cannot be read, neither skip nor recreate: report failure."""
+        def handler(method, url, body):
+            if method == 'GET' and '/containers/sonarr/json' in url:
+                return FakeResponse(200, json.dumps(_skip_container_info(ID_A, 'running')).encode())
+            if method == 'GET' and '/images/json' in url:
+                raise TimeoutError('timed out')
+            return FakeResponse(204)
+
+        patcher, calls = fake_socket(handler)
+        with patcher:
+            result = updater._update_container('sonarr', 'linuxserver/sonarr', SKIP_TARGET_TAG)
+        assert result is False
+        assert not [c for c in calls if c[0] == 'POST'], (
+            f'container was touched without knowing the target ID; calls were: {calls}'
+        )
