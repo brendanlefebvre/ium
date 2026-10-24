@@ -288,6 +288,8 @@ class ImageState:
     tag: str
     digest: str
     last_updated: str
+    pending: Optional[Dict[str, Any]] = None
+    resolve_failure: Optional[Dict[str, Any]] = None
 
 
 class DockerImageUpdater:
@@ -319,6 +321,10 @@ class DockerImageUpdater:
         self.config = self._load_config()
         self.state = self._load_state()
         
+    def _now(self) -> datetime:
+        """Current time; a seam so tests can inject a fake clock."""
+        return datetime.now()
+
     def _setup_logging(self, level: str) -> logging.Logger:
         """Setup logging configuration."""
         logger = logging.getLogger('ium')

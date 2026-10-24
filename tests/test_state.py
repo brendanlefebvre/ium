@@ -17,7 +17,26 @@ class TestImageStateSerialization:
             "tag": "v8.16.2-ls374",
             "digest": "sha256:abc123",
             "last_updated": "2025-01-01T00:00:00",
+            "pending": None,
+            "resolve_failure": None,
         }
+
+    def test_legacy_dict_loads(self):
+        legacy = {"base_tag": "latest", "tag": "v1", "digest": "sha256:x",
+                  "last_updated": "2025-01-01T00:00:00"}
+        state = ImageState(**legacy)
+        assert state.pending is None
+        assert state.resolve_failure is None
+
+    def test_pending_round_trips(self):
+        state = ImageState(
+            base_tag="latest", tag="v1", digest="sha256:x",
+            last_updated="2025-01-01T00:00:00",
+            pending={"tag": "v2", "digest": "sha256:y", "seen": "2025-01-02T00:00:00"},
+        )
+        restored = ImageState(**json.loads(json.dumps(asdict(state))))
+        assert restored == state
+        assert restored.pending["tag"] == "v2"
 
     def test_round_trip_dict(self, sample_state):
         d = asdict(sample_state)
@@ -83,3 +102,12 @@ class TestImageStateConstruction:
         a = ImageState("latest", "v1.0.0", "sha256:abc", "2025-01-01")
         b = ImageState("latest", "v1.0.0", "sha256:def", "2025-01-01")
         assert a != b
+
+
+def test_updater_now_returns_datetime(tmp_path):
+    from datetime import datetime
+    from ium import DockerImageUpdater
+    cfg = tmp_path / "config.json"
+    cfg.write_text('{"images": []}')
+    updater = DockerImageUpdater(str(cfg), str(tmp_path / "state.json"))
+    assert isinstance(updater._now(), datetime)
