@@ -17,7 +17,7 @@ import time
 import logging
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 from pathlib import Path
 from dataclasses import dataclass, asdict
@@ -62,6 +62,10 @@ DEFAULT_REQUEST_TIMEOUT = 60
 
 # Registry (HTTPS) request timeout — unrelated to the Docker socket budget above.
 REGISTRY_REQUEST_TIMEOUT = 30
+
+# A pending (refused) downgrade is notified on first detection, then at most
+# once per this interval; it is re-reported to the UI every cycle regardless.
+DOWNGRADE_RENOTIFY_INTERVAL = timedelta(hours=24)
 
 # Container states that mean "not running", so an update may safely continue
 # after a stop request failed.  'paused' is deliberately excluded: a paused
@@ -324,6 +328,49 @@ class DockerImageUpdater:
     def _now(self) -> datetime:
         """Current time; a seam so tests can inject a fake clock."""
         return datetime.now()
+
+    def _downgrade_pending(self, saved_state: Optional['ImageState'],
+                           digest: str) -> Optional[Dict[str, Any]]:
+        """Return the saved downgrade record if it is for this digest, else None.
+
+        Branches on ``reason`` rather than mere presence: a pending record
+        with another reason (e.g. a future ``'cooldown'``) is not ours.
+        """
+        pending = saved_state.pending if saved_state else None
+        if (pending and pending.get('reason') == 'downgrade'
+                and pending.get('digest') == digest):
+            return pending
+        return None
+
+    def _downgrade_notify_due(self, last_notified: Optional[str],
+                              now: datetime) -> bool:
+        """True on first detection or once ``last_notified`` is >= 24 h old."""
+        if not last_notified:
+            return True
+        try:
+            return now - datetime.fromisoformat(last_notified) >= DOWNGRADE_RENOTIFY_INTERVAL
+        except (TypeError, ValueError):
+            # Unparseable timestamp: notify and overwrite it with a good one.
+            return True
+
+    def _write_pending(self, image: str, saved_state: Optional['ImageState'],
+                       base_tag: str, pending: Dict[str, Any], old_tag: str) -> None:
+        """Record ``pending`` without advancing the saved tag/digest.
+
+        With no saved state (first-ever run lands on a downgrade) the
+        placeholder is ``tag=old_tag, digest=''``, so a later non-downgrade
+        candidate takes the normal path because ``'' != digest``.  Only
+        updates ``self.state``; the end-of-cycle ``_save_state`` persists it
+        (and skips the write in dry run).
+        """
+        if saved_state:
+            tag, digest, last_updated = saved_state.tag, saved_state.digest, saved_state.last_updated
+        else:
+            tag, digest, last_updated = old_tag, '', self._now().isoformat()
+        self.state[image] = ImageState(
+            base_tag=base_tag, tag=tag, digest=digest,
+            last_updated=last_updated, pending=pending,
+        )
 
     def _setup_logging(self, level: str) -> logging.Logger:
         """Setup logging configuration."""
@@ -1707,11 +1754,71 @@ class DockerImageUpdater:
                         and _natural_sort_key(matching_tag) < _natural_sort_key(old_tag)
                     )
                     if is_downgrade:
-                        self.logger.warning(
-                            f"DOWNGRADE DETECTED: {image} candidate {matching_tag} "
-                            f"is older than current {old_tag}; reporting but not "
-                            f"auto-applying"
-                        )
+                        # A refused downgrade never advances state: it is
+                        # held as a `pending` record and re-reported every
+                        # cycle until applied, dismissed, or the registry
+                        # moves on.  Falling through to the state-advance
+                        # block below is what handed a refused downgrade to
+                        # the rebuilt path on the next same-tag re-push.
+                        now = self._now()
+                        now_iso = now.isoformat()
+                        existing = self._downgrade_pending(saved_state, digest)
+                        repeat = existing is not None
+                        if existing is not None:
+                            pending = dict(existing)
+                        else:
+                            pending = {
+                                'tag': matching_tag, 'digest': digest,
+                                'first_seen': now_iso, 'reason': 'downgrade',
+                                'dismissed': False, 'last_notified': None,
+                            }
+
+                        if pending.get('dismissed'):
+                            self.logger.debug(
+                                f"Downgrade {image} {old_tag} -> {matching_tag} "
+                                f"dismissed; waiting for registry change"
+                            )
+                            self._write_pending(image, saved_state, base_tag, pending, old_tag)
+                            continue
+
+                        if repeat:
+                            self.logger.info(
+                                f"DOWNGRADE PENDING: {image} {old_tag} -> {matching_tag} "
+                                f"(first seen {pending.get('first_seen')})"
+                            )
+                        else:
+                            self.logger.warning(
+                                f"DOWNGRADE DETECTED: {image} candidate {matching_tag} "
+                                f"is older than current {old_tag}; reporting but not "
+                                f"auto-applying"
+                            )
+
+                        update_info = {
+                            'image': image,
+                            'base_tag': base_tag,
+                            'old_tag': old_tag,
+                            'new_tag': matching_tag,
+                            'digest': digest,
+                            'auto_update': False,
+                            'downgrade': True,
+                            'repeat': repeat,
+                        }
+                        updates_found.append(update_info)
+                        if progress_callback:
+                            progress_callback('update_found', update_info)
+
+                        if self._downgrade_notify_due(pending.get('last_notified'), now):
+                            send_notifications(
+                                self.config.get('notifications'),
+                                image=image, old_version=old_tag, new_version=matching_tag,
+                                event='update_found', digest=digest,
+                                auto_update=False
+                            )
+                            pending['last_notified'] = now_iso
+
+                        self._write_pending(image, saved_state, base_tag, pending, old_tag)
+                        continue  # never reaches the pull / state-advance code below
+
                     effective_auto_update = auto_update and not is_downgrade
 
                     self.logger.info(f"UPDATE AVAILABLE: {old_tag} -> {matching_tag}")

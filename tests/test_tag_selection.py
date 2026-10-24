@@ -304,9 +304,11 @@ class TestDowngradeGuard:
         # applied=... from this field.
         assert info["auto_update"] is False
         u._pull_image.assert_not_called()
-        # State still moves (existing convention: prevents hourly
-        # re-notification; a bogus candidate self-heals next cycle).
-        assert u.state["forgejo/forgejo"].tag == "9.0.3"
+        # State does NOT advance to the refused tag (spec Part 4): the
+        # candidate is held as a pending downgrade record instead.
+        assert u.state["forgejo/forgejo"].tag == "15.0.2"
+        assert u.state["forgejo/forgejo"].pending["reason"] == "downgrade"
+        assert u.state["forgejo/forgejo"].pending["tag"] == "9.0.3"
         # Notification still goes out, marked not-auto-applied.
         assert mock_notify.call_args.kwargs["auto_update"] is False
 
