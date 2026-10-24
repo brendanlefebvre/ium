@@ -219,3 +219,15 @@ class TestQualifiedImage:
 
     def test_localhost_port_not_doubled(self, ghcr_updater):
         assert ghcr_updater._qualified_image("localhost:5000/x", "ghcr.io") == "localhost:5000/x"
+
+
+class TestCurrentTagQualified:
+    def test_current_tag_uses_qualified_reference(self, ghcr_updater):
+        regex = r"^v[0-9]+\.[0-9]+\.[0-9]+$"
+        imgs = [{"Id": "sha256:abc", "RepoTags": ["ghcr.io/x/y:v1.2.3"]}]
+        with patch.object(ghcr_updater.docker, "inspect_container",
+                          return_value={"Image": "sha256:abc"}), \
+             patch.object(ghcr_updater.docker, "list_images", return_value=imgs) as li:
+            tag = ghcr_updater._get_container_current_tag("c", "x/y", regex, "ghcr.io")
+        li.assert_called_once_with("ghcr.io/x/y")
+        assert tag == "v1.2.3"

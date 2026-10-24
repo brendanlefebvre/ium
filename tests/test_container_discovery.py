@@ -351,3 +351,32 @@ class TestOrphanedContainerFallback:
                           side_effect=DockerAPIError(500, 'boom')):
             with pytest.raises(DockerAPIError):
                 updater._get_containers_for_image('portainer/portainer-ce')
+
+
+class TestCurrentTag:
+    REGEX = r"^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+-ls[0-9]+$"
+    IMG = 'sha256:abc'
+
+    def _call(self, updater, images):
+        with patch.object(updater.docker, 'inspect_container', return_value={'Image': self.IMG}), \
+             patch.object(updater.docker, 'list_images', return_value=images):
+            return updater._get_container_current_tag('sonarr', 'linuxserver/sonarr', self.REGEX)
+
+    def test_inspect_error_raises(self, updater):
+        with patch.object(updater.docker, 'inspect_container',
+                          side_effect=DockerAPIError(0, 'boom')):
+            with pytest.raises(DockerAPIError):
+                updater._get_container_current_tag('sonarr', 'linuxserver/sonarr', self.REGEX)
+
+    def test_list_images_error_raises(self, updater):
+        with patch.object(updater.docker, 'inspect_container', return_value={'Image': self.IMG}), \
+             patch.object(updater.docker, 'list_images', side_effect=DockerAPIError(0, 'boom')):
+            with pytest.raises(DockerAPIError):
+                updater._get_container_current_tag('sonarr', 'linuxserver/sonarr', self.REGEX)
+
+    def test_no_matching_tag_returns_none(self, updater):
+        assert self._call(updater, [{'Id': self.IMG, 'RepoTags': ['x/y:latest']}]) is None
+
+    def test_matching_tag_returned(self, updater):
+        imgs = [{'Id': self.IMG, 'RepoTags': ['linuxserver/sonarr:4.0.1.100-ls1']}]
+        assert self._call(updater, imgs) == '4.0.1.100-ls1'

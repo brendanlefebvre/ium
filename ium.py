@@ -1093,56 +1093,51 @@ class DockerImageUpdater:
         return (normalized_config == normalized_container or
                 strip_library(normalized_config) == strip_library(normalized_container))
 
-    def _get_container_current_tag(self, container_name: str, image: str, regex: str) -> Optional[str]:
-        """Get the current version tag of a running container by checking image inventory."""
-        try:
-            container_info = self._get_container_config(container_name)
-            if not container_info:
-                self.logger.debug(f"Container {container_name} not found or no config")
-                return None
+    def _get_container_current_tag(self, container_name: str, image: str, regex: str,
+                                   registry: Optional[str] = None) -> Optional[str]:
+        """Return the version tag the container runs, by matching its image ID against the
+        local image inventory.
 
-            # Get the image ID (sha256) from the container
-            image_id = container_info.get('Image', '')
-            if not image_id:
-                self.logger.debug(f"No image ID found for container {container_name}")
-                return None
+        Returns None only when the lookup succeeded but the image carries no tag matching
+        the regex. Raises DockerAPIError if the inspect or image listing fails, so callers
+        can tell "unknown" apart from "daemon unreachable".
+        """
+        container_info = self.docker.inspect_container(container_name)
 
-            # Get cached compiled pattern
-            pattern = self.compiled_patterns.get(regex)
-            if not pattern:
-                self.logger.debug(f"Pattern not found in cache: '{regex}'")
-                return None
-
-            # Query Docker API for images matching this name
-            try:
-                images = self.docker.list_images(image)
-            except DockerAPIError:
-                self.logger.debug(f"Failed to get image tags for {image}")
-                return None
-
-            # Normalize the container's image ID for comparison
-            # image_id from inspect is full sha256:..., API returns Id as sha256:...
-            normalized_id = image_id if image_id.startswith('sha256:') else f"sha256:{image_id}"
-
-            # Find tags that match both the image ID and regex pattern
-            for img in images:
-                if img.get('Id', '') != normalized_id:
-                    continue
-                for repo_tag in img.get('RepoTags') or []:
-                    # RepoTags are "image:tag" format
-                    if ':' in repo_tag:
-                        tag = repo_tag.rsplit(':', 1)[1]
-                    else:
-                        tag = repo_tag
-                    if pattern.match(tag):
-                        self.logger.debug(f"Found matching tag for {container_name}: {tag}")
-                        return tag
-
-            self.logger.debug(f"No matching tag found in image inventory for {container_name}")
+        # Get the image ID (sha256) from the container
+        image_id = container_info.get('Image', '')
+        if not image_id:
+            self.logger.debug(f"No image ID found for container {container_name}")
             return None
-        except Exception as e:
-            self.logger.debug(f"Could not get current tag for {container_name}: {e}")
+
+        # Get cached compiled pattern
+        pattern = self.compiled_patterns.get(regex)
+        if not pattern:
+            self.logger.debug(f"Pattern not found in cache: '{regex}'")
             return None
+
+        # Local tags carry the registry host for non-Docker-Hub images
+        images = self.docker.list_images(self._qualified_image(image, registry))
+
+        # image_id from inspect is full sha256:..., API returns Id as sha256:...
+        normalized_id = image_id if image_id.startswith('sha256:') else f"sha256:{image_id}"
+
+        # Find tags that match both the image ID and regex pattern
+        for img in images or []:
+            if img.get('Id', '') != normalized_id:
+                continue
+            for repo_tag in img.get('RepoTags') or []:
+                # RepoTags are "image:tag" format
+                if ':' in repo_tag:
+                    tag = repo_tag.rsplit(':', 1)[1]
+                else:
+                    tag = repo_tag
+                if pattern.match(tag):
+                    self.logger.debug(f"Found matching tag for {container_name}: {tag}")
+                    return tag
+
+        self.logger.debug(f"No matching tag found in image inventory for {container_name}")
+        return None
 
     def _update_container(self, container_name: str, image: str, tag: str,
                           registry: Optional[str] = None,
