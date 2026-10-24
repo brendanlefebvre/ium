@@ -523,6 +523,10 @@ def api_dismiss_update():
     """Ignore a pending downgrade until the registry offers something else."""
     global last_updates
 
+    # A running cycle rewrites state at its end; refuse rather than race it.
+    if is_checking:
+        return jsonify({'error': 'Check in progress; try again shortly'}), 409
+
     data = request.json or {}
     image = (data.get('image') or '').strip()
 

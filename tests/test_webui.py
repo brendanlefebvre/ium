@@ -708,6 +708,22 @@ class TestDismissUpdate:
         assert 'error' in resp.get_json()
         webui_mod.updater._save_state.assert_not_called()
 
+    def test_dismiss_409_while_checking(self, app_client, monkeypatch):
+        """409 while a check is running: the cycle's end-of-run save would race it."""
+        from ium import ImageState
+
+        webui_mod.updater.state['nginx'] = ImageState(
+            base_tag='latest', tag='1.26.0', digest='sha256:cur',
+            last_updated='2026-10-24T00:00:00', pending=_downgrade_pending())
+        monkeypatch.setattr(webui_mod, 'is_checking', True)
+
+        resp = _post_json(app_client, '/api/updates/dismiss', {'image': 'nginx'})
+
+        assert resp.status_code == 409
+        assert resp.get_json() == {'error': 'Check in progress; try again shortly'}
+        assert webui_mod.updater.state['nginx'].pending == _downgrade_pending()
+        webui_mod.updater._save_state.assert_not_called()
+
     def test_dismiss_requires_csrf(self, app_client):
         """Rejects request without CSRF header."""
         resp = app_client.post('/api/updates/dismiss',
