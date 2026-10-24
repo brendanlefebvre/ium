@@ -198,3 +198,24 @@ class TestCheckAndUpdateRegistryFlow:
 
         assert updates == []
         mock_pull.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _qualified_image: registry prefixing helper
+# ---------------------------------------------------------------------------
+
+class TestQualifiedImage:
+    def test_ghcr_override_prefixes(self, ghcr_updater):
+        assert ghcr_updater._qualified_image("x/y", "ghcr.io") == "ghcr.io/x/y"
+
+    def test_docker_hub_untouched(self, ghcr_updater):
+        assert ghcr_updater._qualified_image("x/y", "registry-1.docker.io") == "x/y"
+
+    def test_none_untouched(self, ghcr_updater):
+        assert ghcr_updater._qualified_image("x/y", None) == "x/y"
+
+    def test_already_qualified_not_doubled(self, ghcr_updater):
+        assert ghcr_updater._qualified_image("ghcr.io/x/y", "ghcr.io") == "ghcr.io/x/y"
+
+    def test_localhost_port_not_doubled(self, ghcr_updater):
+        assert ghcr_updater._qualified_image("localhost:5000/x", "ghcr.io") == "localhost:5000/x"

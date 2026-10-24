@@ -886,6 +886,20 @@ class DockerImageUpdater:
         self.logger.error(f"Could not get digest for latest matching tag {image}:{latest_tag}")
         return None
         
+    def _qualified_image(self, image: str, registry: Optional[str]) -> str:
+        """Prefix *image* with *registry* when the Docker daemon needs it.
+
+        Returns *image* unchanged when no registry is given, the registry is
+        Docker Hub, or the image's first path component already names a host
+        (contains '.' or ':', or is 'localhost').
+        """
+        if not registry or registry == DEFAULT_REGISTRY:
+            return image
+        first = image.split('/')[0]
+        if '.' in first or ':' in first or first == 'localhost':
+            return image
+        return f"{registry}/{image}"
+
     def _pull_image(self, image: str, tag: str,
                     registry: Optional[str] = None) -> bool:
         """
@@ -903,11 +917,7 @@ class DockerImageUpdater:
             True if successful, False otherwise
         """
         # Qualify image name with registry when the daemon needs it
-        pull_image = image
-        if registry and registry != DEFAULT_REGISTRY:
-            first = image.split('/')[0]
-            if '.' not in first and first != 'localhost' and ':' not in first:
-                pull_image = f"{registry}/{image}"
+        pull_image = self._qualified_image(image, registry)
 
         full_image = f"{pull_image}:{tag}"
 
@@ -1119,11 +1129,7 @@ class DockerImageUpdater:
         """
         # Apply registry prefix the same way _pull_image does, so the image
         # reference matches what Docker stored when it pulled the image.
-        pull_image = image
-        if registry and registry != DEFAULT_REGISTRY:
-            first = image.split('/')[0]
-            if '.' not in first and first != 'localhost' and ':' not in first:
-                pull_image = f"{registry}/{image}"
+        pull_image = self._qualified_image(image, registry)
         full_image = f"{pull_image}:{tag}"
 
         if self.dry_run:
