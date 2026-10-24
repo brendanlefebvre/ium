@@ -1641,29 +1641,38 @@ class DockerImageUpdater:
             if not saved_state or saved_state.digest != digest:
                 # Discover all containers using this image.  Done only when
                 # the registry has moved, so an unchanged image makes no
-                # Docker call.  A list failure defers the image to the next
-                # cycle before any pull, notification, or state write.
+                # Docker call.  A list or current-tag lookup failure defers
+                # the image to the next cycle before any pull, notification,
+                # or state write.
                 try:
                     containers = self._get_containers_for_image(image)
+
+                    # Current version comes from the first container's actual
+                    # image; saved state is used only when no container runs
+                    # this image.  None from the lookup means the container's
+                    # image carries no regex-matching tag (e.g. orphaned).
+                    old_tag = None
+                    if containers:
+                        old_tag = self._get_container_current_tag(
+                            containers[0]['name'], image, regex, registry)
+                        if not old_tag:
+                            old_tag = 'unknown'
+                    elif saved_state:
+                        old_tag = saved_state.tag
+                    if not old_tag:
+                        old_tag = 'unknown'
                 except DockerAPIError as e:
                     self.logger.warning(
-                        f"Could not list containers for {image} ({e}); "
+                        f"Could not list or inspect containers for {image} ({e}); "
                         f"skipping this cycle so the update is retried"
                     )
                     if progress_callback:
                         progress_callback('check_error', {
                             'image': image, 'base_tag': base_tag,
                             'reason': 'docker_unreachable',
-                            'error': f"Docker daemon unreachable while listing containers for {image}: {e}",
+                            'error': f"Docker daemon unreachable while listing or inspecting containers for {image}: {e}",
                         })
                     continue
-
-                # Determine current version (from saved state or first container)
-                old_tag = saved_state.tag if saved_state else None
-                if not old_tag and containers:
-                    old_tag = self._get_container_current_tag(containers[0]['name'], image, regex)
-                if not old_tag:
-                    old_tag = 'unknown'
 
                 # Only report update if tags are actually different
                 if old_tag != matching_tag:

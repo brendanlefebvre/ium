@@ -111,7 +111,7 @@ class TestMultiContainerUpdate:
             updates = updater.check_and_update()
 
             # Should query first container for current version
-            mock_get_tag.assert_called_once_with('sonarr-hd', 'linuxserver/sonarr', updater.config['images'][0]['regex'])
+            mock_get_tag.assert_called_once_with('sonarr-hd', 'linuxserver/sonarr', updater.config['images'][0]['regex'], None)
 
             # Update should use detected version as old_tag
             assert updates[0]['old_tag'] == '4.0.0.740-ls290'
