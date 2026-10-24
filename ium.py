@@ -67,6 +67,10 @@ REGISTRY_REQUEST_TIMEOUT = 30
 # after a stop request failed.  'paused' is deliberately excluded: a paused
 # container still holds its processes.
 STOPPED_STATUSES = frozenset({'exited', 'created', 'dead'})
+
+# Docker's container list reports a bare image ID (instead of a name) when the
+# container's original image reference no longer resolves to its image.
+ID_LIKE = re.compile(r'^(sha256:)?[0-9a-f]{12,64}$')
 MANIFEST_ACCEPT_HEADER = (
     "application/vnd.docker.distribution.manifest.list.v2+json,"
     "application/vnd.docker.distribution.manifest.v2+json,"
@@ -993,6 +997,32 @@ class DockerImageUpdater:
                         'id': container.get('Id', ''),
                         'state': container.get('State', ''),
                         'image_ref': container_image
+                    })
+
+            # Orphaned containers: the list reports a bare image ID, but
+            # inspect still shows the original Config.Image string.
+            for container in api_containers:
+                container_image = container.get('Image', '')
+                if not ID_LIKE.match(container_image):
+                    continue  # already handled by name match
+                names = container.get('Names') or ['/']
+                name = names[0].lstrip('/')
+                # Direct call (not _get_container_config, which swallows
+                # errors): DockerAPIError must propagate.
+                info = self.docker.inspect_container(name)
+                cfg_image = ((info or {}).get('Config') or {}).get('Image', '')
+                if cfg_image and self._image_matches(image, cfg_image):
+                    self.logger.warning(
+                        f"Container {name} runs {image} but its image tag no longer "
+                        f"resolves locally (list reports {container_image[:19]}); "
+                        f"matched via inspect"
+                    )
+                    containers.append({
+                        'name': name,
+                        'id': container.get('Id', ''),
+                        'state': container.get('State', ''),
+                        'image_ref': cfg_image,
+                        'orphaned': True,
                     })
 
             if not containers and all_images:

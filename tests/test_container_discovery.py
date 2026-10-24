@@ -298,3 +298,56 @@ class TestUpdateContainers:
 
             assert results == {'sonarr': True}
             assert mock_update.call_count == 1
+
+
+class TestOrphanedContainerFallback:
+    """Containers whose image tag was re-pointed are listed by bare image ID."""
+
+    ORPHAN = {'Id': 'c1', 'Names': ['/portainer'], 'Image': '3fe380ead685',
+              'State': 'running'}
+
+    def _inspect(self, cfg_image):
+        return {'Config': {'Image': cfg_image}, 'Image': 'sha256:3fe380ead685'}
+
+    def test_orphan_found_via_inspect(self, updater):
+        with patch.object(updater.docker, 'list_containers', return_value=[self.ORPHAN]), \
+             patch.object(updater.docker, 'inspect_container',
+                          return_value=self._inspect('portainer/portainer-ce:2.45.0')):
+            with patch.object(updater.logger, 'warning') as warn:
+                result = updater._get_containers_for_image('portainer/portainer-ce')
+        assert result == [{'name': 'portainer', 'id': 'c1', 'state': 'running',
+                           'image_ref': 'portainer/portainer-ce:2.45.0',
+                           'orphaned': True}]
+        assert any('matched via inspect' in c.args[0] for c in warn.call_args_list)
+
+    def test_sha256_prefixed_id_also_treated_as_id(self, updater):
+        orphan = dict(self.ORPHAN, Image='sha256:' + 'a' * 64)
+        with patch.object(updater.docker, 'list_containers', return_value=[orphan]), \
+             patch.object(updater.docker, 'inspect_container',
+                          return_value=self._inspect('portainer/portainer-ce:2.45.0')) as insp:
+            result = updater._get_containers_for_image('portainer/portainer-ce')
+        insp.assert_called_once_with('portainer')
+        assert len(result) == 1
+
+    def test_orphan_of_other_repo_not_matched(self, updater):
+        with patch.object(updater.docker, 'list_containers', return_value=[self.ORPHAN]), \
+             patch.object(updater.docker, 'inspect_container',
+                          return_value=self._inspect('linuxserver/sonarr:1')) as insp:
+            result = updater._get_containers_for_image('portainer/portainer-ce')
+        assert result == []
+        assert insp.call_count == 1
+
+    def test_named_containers_not_inspected(self, updater):
+        named = dict(self.ORPHAN, Image='portainer/portainer-ce:2.45.0')
+        with patch.object(updater.docker, 'list_containers', return_value=[named]), \
+             patch.object(updater.docker, 'inspect_container') as insp:
+            result = updater._get_containers_for_image('portainer/portainer-ce')
+        assert len(result) == 1
+        assert insp.call_count == 0
+
+    def test_inspect_error_propagates(self, updater):
+        with patch.object(updater.docker, 'list_containers', return_value=[self.ORPHAN]), \
+             patch.object(updater.docker, 'inspect_container',
+                          side_effect=DockerAPIError(500, 'boom')):
+            with pytest.raises(DockerAPIError):
+                updater._get_containers_for_image('portainer/portainer-ce')
