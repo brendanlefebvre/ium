@@ -2130,9 +2130,15 @@ class DockerImageUpdater:
                     # of defense against bad candidates (2026-05-24 forgejo
                     # incident); a genuine upstream rollback can still be
                     # applied manually.
+                    # When the container yields no regex-matching tag
+                    # ('unknown', e.g. created from :latest or orphaned), guard
+                    # against the saved tag instead; old_tag stays 'unknown'
+                    # for routing and reporting.
+                    guard_tag = old_tag if old_tag != 'unknown' else (
+                        saved_state.tag if saved_state else None)
                     is_downgrade = (
-                        old_tag not in (None, 'unknown')
-                        and _natural_sort_key(matching_tag) < _natural_sort_key(old_tag)
+                        guard_tag not in (None, 'unknown')
+                        and _natural_sort_key(matching_tag) < _natural_sort_key(guard_tag)
                     )
                     if is_downgrade:
                         # A refused downgrade never advances state: it is

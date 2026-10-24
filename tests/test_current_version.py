@@ -100,3 +100,20 @@ def test_lookup_error_defers(updater):
     assert len(errors) == 1
     assert errors[0]['reason'] == 'docker_unreachable'
     assert updater.state[IMAGE].tag == '4.0.15.2941-ls329'
+
+
+def test_orphan_downgrade_guarded_by_saved_tag(updater):
+    # The container's image has no regex-matching tag (lookup -> None), but
+    # saved state knows the version: an older candidate must still be refused.
+    _seed(updater, '2.45.3')
+    updates, _, pull, update = _run(updater, '2.39.0', CONTAINERS, current_tag=None)
+    update.assert_not_called()
+    pull.assert_not_called()
+    assert updates[0]['downgrade'] is True
+    assert updates[0]['auto_update'] is False
+    assert updates[0]['old_tag'] == 'unknown'
+    state = updater._load_state()[IMAGE]
+    assert state.tag == '2.45.3'
+    assert state.digest == 'sha256:olddigest'
+    assert state.pending['tag'] == '2.39.0'
+    assert state.pending['reason'] == 'downgrade'
