@@ -1690,39 +1690,67 @@ class DockerImageUpdater:
 
             # Create and start new container
             self.logger.info(f"Creating new container {container_name}...")
+            # Track how far the replacement got: the backup may only be
+            # discarded once the replacement has actually started.
+            new_id: Optional[str] = None
+            started = False
             try:
-                container_id = self.docker.create_container(
+                new_id = self.docker.create_container(
                     container_name, create_config, timeout=request_timeout)
-                self.docker.start_container(container_id, timeout=request_timeout)
+                self.docker.start_container(new_id, timeout=request_timeout)
+                started = True
 
                 # Connect to additional networks
                 for network in extra_networks:
-                    self.docker.connect_network(network, container_id,
+                    self.docker.connect_network(network, new_id,
                                                 timeout=request_timeout)
 
             except DockerAPIError as e:
                 # Rollback on failure
-                self.logger.error(f"Failed to create new container: {e.message}")
+                stage = ('connect networks for' if started
+                         else ('start' if new_id else 'create'))
+                self.logger.error(f"Failed to {stage} new container: {e.message}")
                 self.logger.info("Rolling back...")
+                if new_id and not started:
+                    # The replacement exists under the service name but never
+                    # ran.  Remove it so the backup can take the name back.
+                    try:
+                        self.docker.remove_container(new_id, force=True, timeout=120)
+                    except (DockerAPIError, OSError, TimeoutError) as rm_err:
+                        self.logger.error(
+                            f"Could not remove the failed replacement {new_id[:12]} "
+                            f"({rm_err}); {backup_name} still holds the previous "
+                            f"container — restore it manually"
+                        )
+                        return False
                 try:
                     self.docker.rename_container(backup_name, container_name,
                                                 timeout=request_timeout)
                     self.docker.start_container(container_name,
                                                timeout=request_timeout)
                 except DockerAPIError as rb_err:
-                    # Rename failed — the new container likely took the name already
-                    # (e.g. it was created and started before an extra-network connect
-                    # failed).  Remove the stranded backup instead of leaving it.
-                    self.logger.warning(
-                        f"Rollback rename failed ({rb_err.message}); "
-                        f"removing stranded backup {backup_name}"
-                    )
-                    try:
-                        self.docker.remove_container(backup_name, force=True, timeout=120)
-                    except (DockerAPIError, OSError, TimeoutError) as rm_err:
+                    if started:
+                        # The replacement started and holds the name (an
+                        # extra-network connect failed after start), so the
+                        # rename back conflicts.  The replacement is running;
+                        # remove the stranded backup instead of leaving it.
                         self.logger.warning(
-                            f"Could not remove backup container {backup_name}: {rm_err} "
-                            f"— remove it manually"
+                            f"Rollback rename failed ({rb_err.message}); "
+                            f"removing stranded backup {backup_name}"
+                        )
+                        try:
+                            self.docker.remove_container(backup_name, force=True, timeout=120)
+                        except (DockerAPIError, OSError, TimeoutError) as rm_err:
+                            self.logger.warning(
+                                f"Could not remove backup container {backup_name}: {rm_err} "
+                                f"— remove it manually"
+                            )
+                    else:
+                        # The replacement never ran: the backup is the only
+                        # working copy and must never be removed here.
+                        self.logger.error(
+                            f"Rollback failed ({rb_err.message}); {backup_name} still holds "
+                            f"the previous container — restore it manually"
                         )
                 return False
 
