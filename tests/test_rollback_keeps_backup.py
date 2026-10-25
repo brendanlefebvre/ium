@@ -58,7 +58,8 @@ def _is_rename_back(url):
 
 
 def _make_handler(info=CONTAINER_INFO, create_fails=False, start_new_fails=False,
-                  connect_fails=False, rename_back_conflicts=False):
+                  connect_fails=False, rename_back_conflicts=False,
+                  start_old_fails=False):
     def handler(method, url, body):
         if method == "GET" and "/containers/sonarr/json" in url:
             return FakeResponse(200, json.dumps(info).encode())
@@ -68,6 +69,8 @@ def _make_handler(info=CONTAINER_INFO, create_fails=False, start_new_fails=False
             return FakeResponse(201, json.dumps({"Id": "new123"}).encode())
         if method == "POST" and "/containers/new123/start" in url:
             return _no_such_container() if start_new_fails else FakeResponse(204)
+        if method == "POST" and "/containers/sonarr/start" in url and start_old_fails:
+            return _no_such_container()
         if method == "POST" and "/networks/" in url and "/connect" in url:
             return _no_such_container() if connect_fails else FakeResponse(204)
         if method == "POST" and _is_rename_back(url) and rename_back_conflicts:
@@ -181,3 +184,25 @@ class TestStageLogging:
     def test_create_failure_logs_create_stage(self, updater, captured):
         _run(updater, _make_handler(create_fails=True))
         assert "Failed to create new container" in captured.text
+
+    def test_rename_conflict_names_the_backup(self, updater, captured):
+        _run(updater, _make_handler(start_new_fails=True, rename_back_conflicts=True))
+        assert re.search(r"Rollback failed .*sonarr_backup_\d+ still holds", captured.text), (
+            captured.text
+        )
+
+    def test_restored_container_failing_to_start_is_named_by_its_own_name(
+        self, updater, captured
+    ):
+        # The backup shares the replacement's dead network parent, so it will
+        # not start either.  By then it is back under the service name, so the
+        # log must not send the operator looking for a backup that no longer
+        # exists.
+        result, calls = _run(
+            updater, _make_handler(start_new_fails=True, start_old_fails=True)
+        )
+        assert result is False
+        assert _rename_backs(calls), f"backup was never renamed back; calls: {calls}"
+        assert not _backup_deletes(calls)
+        assert "Rollback restored sonarr but it failed to start" in captured.text
+        assert "_backup_" not in captured.text.split("Rollback restored")[-1]

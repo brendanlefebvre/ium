@@ -1731,13 +1731,23 @@ class DockerImageUpdater:
                             f"container — restore it manually"
                         )
                         return False
+                renamed_back = False
                 try:
                     self.docker.rename_container(backup_name, container_name,
                                                 timeout=request_timeout)
+                    renamed_back = True
                     self.docker.start_container(container_name,
                                                timeout=request_timeout)
                 except DockerAPIError as rb_err:
-                    if started:
+                    if renamed_back:
+                        # The previous container is back under its own name
+                        # but would not start (it may share the cause of the
+                        # replacement's failure, e.g. a dead network parent).
+                        self.logger.error(
+                            f"Rollback restored {container_name} but it failed to "
+                            f"start ({rb_err.message}) — fix the cause and start it manually"
+                        )
+                    elif started:
                         # The replacement started and holds the name (an
                         # extra-network connect failed after start), so the
                         # rename back conflicts.  The replacement is running;

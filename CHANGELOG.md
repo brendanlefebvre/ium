@@ -14,7 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - The rebuilt-branch skip check compares image IDs rather than image strings, so a container is skipped only when it already runs the target image
 - A downgrade refused by the downgrade guard no longer advances saved state, so a later cycle cannot silently recreate the container on the refused tag
 - Registry tag listing follows `Link` pagination headers (capped at 50 pages); ghcr.io returns only 100 tags per page, which hid newer versions
-- Rollback no longer deletes the backup container when the replacement was created but failed to start; the replacement is removed and the previous container restored instead. Previously a start failure (e.g. a `network_mode: container:<id>` pointing at a recreated container) left the service down with its only working copy removed.
+- Rollback no longer deletes the backup container when the replacement was created but failed to start; the replacement is removed and the backup is renamed back and started. Previously a start failure (e.g. a `network_mode: container:<id>` pointing at a recreated container) left the service down with its only working copy removed.
 - Registry tag pagination only follows `Link: rel="next"` targets on the same scheme and host as the tags endpoint, so the bearer token is never sent elsewhere.
 
 ### Added
