@@ -78,16 +78,24 @@ class ImageState:
     tag: str
     digest: str
     last_updated: str
-    pending: Optional[Dict[str, str]] = None   # {"tag", "digest", "first_seen"}
+    pending: Optional[Dict[str, Any]] = None   # exists since 1.5.0
+```
+
+The `pending` field already exists: 1.5.0 added it for refused downgrades,
+whose records carry `reason: "downgrade"`. This spec adds a second record
+shape to the same field:
+
+```json
+{"tag": "...", "digest": "sha256:...", "first_seen": "...", "reason": "cooldown"}
 ```
 
 - `first_seen` is a UTC ISO-8601 timestamp produced by
   `datetime.now(timezone.utc).isoformat()`. UTC is deliberate: the age
   computation must not shift by an hour across DST.
-- `_load_state` constructs `ImageState(**image_data)`; the default makes
-  state files written before 1.6.0 load unchanged. `_save_state` uses
-  `asdict`, which serialises the nested dict as-is. No migration step.
-- `pending` is only ever set while an auto-update is deferred. It is cleared
+- `_load_state` and `_save_state` already handle the field (1.5.0). No
+  migration step. Code that reads `pending` must check `reason` before
+  interpreting the record; a downgrade record is never treated as a cooldown.
+- A cooldown record is only ever set while an auto-update is deferred. It is cleared
   (the whole `ImageState` is rewritten without it) whenever `state.tag`
   advances, including by the manual apply handler in `webui.py`, which
   already constructs a fresh `ImageState`.
@@ -147,8 +155,11 @@ Behaviour that follows from the gate:
 - **Image rebuilt branch**: identical treatment. Note this branch today uses
   `auto_update` rather than `effective_auto_update`; the implementor should
   introduce the same local name there so the gate reads identically.
-- **Downgrade**: `effective_auto_update` is already false, so the gate is
-  skipped and nothing is recorded. Unchanged from today.
+- **Downgrade**: `effective_auto_update` is already false, so the cooldown
+  gate is skipped. 1.5.0's downgrade handling still writes its own
+  `reason: "downgrade"` pending record, and a downgrade candidate replaces
+  any cooldown record for the image (the cooldown clock is moot once the
+  candidate is refused outright).
 - **Non-auto image**: gate skipped; state advances immediately as today.
 - **Dry run**: `self.state` is mutated in memory but `_save_state` already
   returns early in dry-run mode, so no pending record reaches disk.
@@ -204,7 +215,8 @@ not an acceptable outcome.
 5. `auto_update: false` with the key set → state advances immediately,
    `pending` never set (unchanged behaviour).
 6. Downgrade candidate with the key set → reported, not applied, `pending`
-   never set.
+   holds a `reason: "downgrade"` record (1.5.0 behaviour), never a cooldown
+   record; an existing cooldown record is replaced.
 7. Key absent or `0` → applied immediately (unchanged behaviour).
 8. "Image rebuilt" branch (same tag, new digest) with the key set → deferred
    exactly like case 1, applied after the window.
@@ -385,11 +397,11 @@ before 1.3 (flow), and 1.3 before 1.4/1.5. Bump `__version__` to `1.6.0` last.
 ## Compatibility
 
 - Config files without `min_release_age_hours` validate and behave as before.
-- State files without `pending` load as before. A state file written by
-  1.6.0 and read by an older ium would fail `ImageState(**data)` on the
-  unknown key; downgrading past 1.6.0 therefore requires deleting the
-  `pending` keys from `state/image_update_state.json`. Note this in the
-  release notes.
+- State files: no new fields. `pending` has existed since 1.5.0 (see that
+  spec's Compatibility section for the 1.4.0 rollback behaviour). A 1.5.0
+  ium reading a `reason: "cooldown"` record ignores it (it only acts on
+  `reason: "downgrade"`), so rolling back from 1.6.0 to 1.5.0 needs no
+  state edits.
 - Notification payloads are unchanged unless an update is deferred.
 - No Docker Engine API changes; every call used already exists in
   `docker_api.py`.

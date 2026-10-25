@@ -421,6 +421,10 @@ return tags
   registry base. ghcr.io sends a relative path such as
   `/v2/homarr-labs/homarr/tags/list?last=feat-no-tasks-modals&n=0`; pass the
   query through untouched, including the odd `n=0`.
+- `_next_link` returns `None` for a target whose scheme or host differs from
+  the registry base, which ends pagination with the pages fetched so far.
+  The next request carries the registry bearer token, and no registry sends
+  a cross-origin `next` link, so there is nothing to lose by refusing one.
 - Any `RequestException` mid-way keeps the existing behaviour: log and
   return `[]` (not the partial list), so the caller's "could not get tags"
   path fires and the cycle is skipped rather than resolved against a
@@ -589,8 +593,8 @@ After bookkeeping and diagnosis, with `age = now - rf['since']` and
 | Condition | Action |
 |---|---|
 | `age < 24 h` | Nothing (beyond A's immediate notification, if any). |
-| `24 h <= age < 7 d` and `gap >= 24 h` | Send `resolve_failure`; set `last_notified`. |
-| `age >= 7 d` and `gap >= 7 d` | Send `resolve_failure`; set `last_notified`. |
+| `24 h <= age <= 7 d` and `gap >= 24 h` | Send `resolve_failure`; set `last_notified`. |
+| `age > 7 d` and `gap >= 7 d` | Send `resolve_failure`; set `last_notified`. |
 
 Brendan's schedule: daily for the first week, weekly after. A's immediate
 notification counts as a send for gap purposes, so a `regex_stale` finding
@@ -744,7 +748,8 @@ skipped test indicates a missing fixture, not a passing bar.
 carrying a `headers` dict):**
 - Two pages joined by a relative `Link` header → both pages' tags returned,
   second request URL is the resolved link.
-- Absolute `Link` URL → used as given.
+- Absolute same-origin `Link` URL → used as given.
+- Absolute `Link` URL on another host or scheme → `None`, pagination stops.
 - No `Link` → single request (regression guard).
 - Page cap reached → WARNING logged, tags from the fetched pages returned.
 - Second page raises → `[]` returned, not the partial list.
@@ -773,6 +778,43 @@ It must return the container with `orphaned == True`. Tear down afterwards.
 7. Bump `__version__` to `1.5.0`; update `CHANGELOG` if present. Retarget
    `2026-10-11-release-cooldown-and-child-reconnect-design.md` to 1.6.0
    (done in this commit).
+
+## Part 8: Rollback keeps the backup unless the replacement started
+
+Added 2026-10-25 after a second production incident on the same NAS.
+qbittorrent runs with `network_mode: container:<gluetun id>`; gluetun had
+been recreated the day before, so the id in qbittorrent's host config no
+longer existed. On the next qbittorrent update `create_container` succeeded
+(the replacement took the service name), `start_container` failed with
+`No such container: <old gluetun id>`, and rollback's rename of the backup
+hit a name conflict. The existing code read a rename conflict as "the
+replacement is running" (the `connect_network`-failed case) and
+force-removed the backup, the only working copy. The replacement was left
+in state `created` and every later cycle failed to start it, re-sending the
+`update_found` notification hourly.
+
+Rules for `_update_container`'s rollback:
+
+- Track which stage failed: create, start, or connect networks. The error
+  log names the stage (`Failed to start new container: ...`).
+- If the replacement was created but never started, remove **it** first,
+  then rename the backup back and start it. If removing the replacement
+  fails, log that the backup still holds the previous container and stop.
+- The backup is removed only when the replacement's `start_container`
+  succeeded (a later `connect_network` failed and the replacement holds
+  the name). This is the only case in which the old behaviour was right.
+- If the rename back fails and the replacement never started, log the
+  failure naming the backup container and leave both in place; never
+  delete the backup on a guess.
+
+Tests (`tests/test_rollback_keeps_backup.py`, fake Docker socket): start
+failure → replacement deleted, backup renamed back and started, no delete
+of the backup; start failure plus rename conflict → backup untouched;
+connect failure after start plus rename conflict → backup removed,
+replacement kept; create failure → nothing deleted, backup restored.
+
+The underlying cause, a dependent container pinned to a recreated
+parent's id, is the child-reconnect half of the 1.6.0 spec.
 
 ## Compatibility
 
