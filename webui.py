@@ -22,6 +22,7 @@ import jsonschema
 from flask import Flask, render_template, jsonify, request, Response
 from flask_socketio import SocketIO, emit
 
+from docker_api import DockerAPIError
 from ium import DockerImageUpdater, CONFIG_SCHEMA, __version__, _validate_regex, AuthManager, ImageState
 from notify import send_ntfy, send_webhook, _build_payload
 from pattern_utils import detect_tag_patterns, detect_base_tags
@@ -223,6 +224,10 @@ def run_check():
             # Add to history
             if updates:
                 for update in updates:
+                    # A pending downgrade is re-reported every cycle; record
+                    # only its first detection so it cannot crowd out history.
+                    if update.get('repeat'):
+                        continue
                     update_history.append({
                         'timestamp': last_check_time.isoformat(),
                         'image': update['image'],
@@ -471,7 +476,13 @@ def api_apply_update():
             return jsonify({'error': f'Failed to pull {image}:{new_tag}'}), 500
 
         # Discover and update containers
-        containers = updater._get_containers_for_image(image)
+        try:
+            containers = updater._get_containers_for_image(image)
+        except DockerAPIError as e:
+            logger.warning(f"apply-update: could not list containers for {image}: {e}")
+            return jsonify({
+                'error': f"Docker daemon unreachable while listing containers for {image}: {e}"
+            }), 503
         if containers:
             container_names = [c['name'] for c in containers]
             results = updater._update_containers(container_names, image, new_tag, registry)
@@ -504,6 +515,37 @@ def api_apply_update():
     except Exception as e:
         logger.error(f"apply-update failed for {image}: {e}")
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/updates/dismiss', methods=['POST'])
+@require_updater
+def api_dismiss_update():
+    """Ignore a pending downgrade until the registry offers something else."""
+    global last_updates
+
+    # A running cycle rewrites state at its end; refuse rather than race it.
+    if is_checking:
+        return jsonify({'error': 'Check in progress; try again shortly'}), 409
+
+    data = request.json or {}
+    image = (data.get('image') or '').strip()
+
+    image_state = updater.state.get(image)
+    pending = getattr(image_state, 'pending', None)
+    if not pending or pending.get('reason') != 'downgrade':
+        return jsonify({'error': f'No pending downgrade found for {image}'}), 404
+
+    pending['dismissed'] = True
+    updater._save_state()
+
+    last_updates = [u for u in last_updates if u.get('image') != image]
+    socketio.emit('check_complete', {
+        'updates': last_updates,
+        'timestamp': last_check_time.isoformat() if last_check_time else None
+    }, namespace='/')
+
+    logger.info(f"Dismissed pending downgrade for {image} -> {pending.get('tag')}")
+    return jsonify({'success': True})
 
 
 @app.route('/api/daemon', methods=['POST'])

@@ -613,9 +613,148 @@ class TestApplyUpdate:
         assert resp.status_code == 500
         assert 'error' in resp.get_json()
 
+    def test_apply_update_docker_unreachable(self, app_client, monkeypatch):
+        """Returns 503 and leaves state untouched when containers cannot be listed."""
+        import webui as webui_mod
+        from docker_api import DockerAPIError
+
+        monkeypatch.setattr(webui_mod, 'last_updates', [{
+            'image': 'nginx', 'base_tag': 'latest',
+            'old_tag': '1.26.0', 'new_tag': '1.27.0',
+            'digest': 'sha256:abc', 'auto_update': False
+        }])
+        monkeypatch.setattr(webui_mod.updater, '_pull_image', MagicMock(return_value=True))
+        monkeypatch.setattr(webui_mod.updater, '_get_containers_for_image',
+                            MagicMock(side_effect=DockerAPIError(0, "boom")))
+        mock_update_containers = MagicMock()
+        monkeypatch.setattr(webui_mod.updater, '_update_containers', mock_update_containers)
+
+        resp = _post_json(app_client, '/api/apply-update', {
+            'image': 'nginx', 'new_tag': '1.27.0'
+        })
+        assert resp.status_code == 503
+        assert 'unreachable' in resp.get_json()['error']
+        mock_update_containers.assert_not_called()
+        assert 'nginx' not in webui_mod.updater.state
+
     def test_apply_update_requires_csrf(self, app_client):
         """Rejects request without CSRF header."""
         resp = app_client.post('/api/apply-update',
                                data=json.dumps({'image': 'nginx', 'new_tag': '1.0.0'}),
                                content_type='application/json')
         assert resp.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# POST /api/updates/dismiss
+# ---------------------------------------------------------------------------
+
+def _downgrade_pending(dismissed=False):
+    return {
+        'tag': '1.25.0',
+        'digest': 'sha256:old',
+        'first_seen': '2026-10-24T00:00:00',
+        'reason': 'downgrade',
+        'dismissed': dismissed,
+        'last_notified': '2026-10-24T00:00:00',
+    }
+
+
+class TestDismissUpdate:
+    """Tests for the pending-downgrade dismiss endpoint."""
+
+    def test_dismiss_marks_pending_and_trims(self, app_client, monkeypatch):
+        """200: pending marked dismissed, state saved, entry dropped, tabs told."""
+        from ium import ImageState
+
+        webui_mod.updater.state['nginx'] = ImageState(
+            base_tag='latest', tag='1.26.0', digest='sha256:cur',
+            last_updated='2026-10-24T00:00:00', pending=_downgrade_pending())
+        other = {'image': 'redis', 'old_tag': '7.0.0', 'new_tag': '7.2.0'}
+        monkeypatch.setattr(webui_mod, 'last_updates', [
+            {'image': 'nginx', 'old_tag': '1.26.0', 'new_tag': '1.25.0',
+             'downgrade': True, 'auto_update': False, 'repeat': True},
+            other,
+        ])
+        mock_emit = MagicMock()
+        monkeypatch.setattr(webui_mod.socketio, 'emit', mock_emit)
+
+        resp = _post_json(app_client, '/api/updates/dismiss', {'image': 'nginx'})
+
+        assert resp.status_code == 200
+        assert resp.get_json() == {'success': True}
+        assert webui_mod.updater.state['nginx'].pending['dismissed'] is True
+        webui_mod.updater._save_state.assert_called_once()
+        assert webui_mod.last_updates == [other]
+        mock_emit.assert_called_once()
+        args, kwargs = mock_emit.call_args
+        assert args[0] == 'check_complete'
+        assert args[1]['updates'] == [other]
+        assert kwargs.get('namespace') == '/'
+
+    def test_dismiss_404_without_pending(self, app_client):
+        """404 when the image has no state, or state without a downgrade pending."""
+        from ium import ImageState
+
+        resp = _post_json(app_client, '/api/updates/dismiss', {'image': 'nginx'})
+        assert resp.status_code == 404
+        assert 'error' in resp.get_json()
+
+        webui_mod.updater.state['nginx'] = ImageState(
+            base_tag='latest', tag='1.26.0', digest='sha256:cur',
+            last_updated='2026-10-24T00:00:00')
+        resp = _post_json(app_client, '/api/updates/dismiss', {'image': 'nginx'})
+        assert resp.status_code == 404
+        assert 'error' in resp.get_json()
+        webui_mod.updater._save_state.assert_not_called()
+
+    def test_dismiss_409_while_checking(self, app_client, monkeypatch):
+        """409 while a check is running: the cycle's end-of-run save would race it."""
+        from ium import ImageState
+
+        webui_mod.updater.state['nginx'] = ImageState(
+            base_tag='latest', tag='1.26.0', digest='sha256:cur',
+            last_updated='2026-10-24T00:00:00', pending=_downgrade_pending())
+        monkeypatch.setattr(webui_mod, 'is_checking', True)
+
+        resp = _post_json(app_client, '/api/updates/dismiss', {'image': 'nginx'})
+
+        assert resp.status_code == 409
+        assert resp.get_json() == {'error': 'Check in progress; try again shortly'}
+        assert webui_mod.updater.state['nginx'].pending == _downgrade_pending()
+        webui_mod.updater._save_state.assert_not_called()
+
+    def test_dismiss_requires_csrf(self, app_client):
+        """Rejects request without CSRF header."""
+        resp = app_client.post('/api/updates/dismiss',
+                               data=json.dumps({'image': 'nginx'}),
+                               content_type='application/json')
+        assert resp.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# run_check history filtering
+# ---------------------------------------------------------------------------
+
+class TestRunCheckHistory:
+    """Re-reported pending downgrades stay out of update_history."""
+
+    def _run(self, monkeypatch, updates):
+        webui_mod.updater.check_and_update = MagicMock(return_value=updates)
+        monkeypatch.setattr(webui_mod.socketio, 'emit', MagicMock())
+        monkeypatch.setattr(webui_mod, 'save_history', MagicMock())
+        webui_mod.run_check()
+
+    def test_repeat_update_not_appended_to_history(self, app_client, monkeypatch):
+        update = {'image': 'nginx', 'old_tag': '1.26.0', 'new_tag': '1.25.0',
+                  'downgrade': True, 'auto_update': False, 'repeat': True}
+        self._run(monkeypatch, [update])
+        assert webui_mod.update_history == []
+        assert webui_mod.last_updates == [update]
+
+    def test_first_detection_appended_to_history(self, app_client, monkeypatch):
+        update = {'image': 'nginx', 'old_tag': '1.26.0', 'new_tag': '1.25.0',
+                  'downgrade': True, 'auto_update': False, 'repeat': False}
+        self._run(monkeypatch, [update])
+        assert len(webui_mod.update_history) == 1
+        assert webui_mod.update_history[0]['new_tag'] == '1.25.0'

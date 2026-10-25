@@ -60,6 +60,7 @@ class TestUpdateContainerImageReference:
             patch.object(updater.docker, "create_container", return_value="newid"),
             patch.object(updater.docker, "start_container"),
             patch.object(updater.docker, "remove_container"),
+            patch.object(updater.docker, "list_images", return_value=[]),
         ]
 
     def test_registry_override_prefixes_image(self, ghcr_updater):
@@ -70,7 +71,7 @@ class TestUpdateContainerImageReference:
         """
         captured = []
         patches = self._patch_docker_ops(ghcr_updater, captured)
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7]:
             result = ghcr_updater._update_container(
                 "homarr", "homarr-labs/homarr", "v1.9.0", registry="ghcr.io"
             )
@@ -82,7 +83,7 @@ class TestUpdateContainerImageReference:
         """Without a registry override the image reference is unchanged."""
         captured = []
         patches = self._patch_docker_ops(ghcr_updater, captured)
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7]:
             result = ghcr_updater._update_container(
                 "sonarr", "linuxserver/sonarr", "4.0.16.2944-ls299"
             )
@@ -94,7 +95,7 @@ class TestUpdateContainerImageReference:
         """Image already containing the registry host must not be double-prefixed."""
         captured = []
         patches = self._patch_docker_ops(ghcr_updater, captured)
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7]:
             result = ghcr_updater._update_container(
                 "homarr", "ghcr.io/homarr-labs/homarr", "v1.9.0", registry="ghcr.io"
             )
@@ -198,3 +199,36 @@ class TestCheckAndUpdateRegistryFlow:
 
         assert updates == []
         mock_pull.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _qualified_image: registry prefixing helper
+# ---------------------------------------------------------------------------
+
+class TestQualifiedImage:
+    def test_ghcr_override_prefixes(self, ghcr_updater):
+        assert ghcr_updater._qualified_image("x/y", "ghcr.io") == "ghcr.io/x/y"
+
+    def test_docker_hub_untouched(self, ghcr_updater):
+        assert ghcr_updater._qualified_image("x/y", "registry-1.docker.io") == "x/y"
+
+    def test_none_untouched(self, ghcr_updater):
+        assert ghcr_updater._qualified_image("x/y", None) == "x/y"
+
+    def test_already_qualified_not_doubled(self, ghcr_updater):
+        assert ghcr_updater._qualified_image("ghcr.io/x/y", "ghcr.io") == "ghcr.io/x/y"
+
+    def test_localhost_port_not_doubled(self, ghcr_updater):
+        assert ghcr_updater._qualified_image("localhost:5000/x", "ghcr.io") == "localhost:5000/x"
+
+
+class TestCurrentTagQualified:
+    def test_current_tag_uses_qualified_reference(self, ghcr_updater):
+        regex = r"^v[0-9]+\.[0-9]+\.[0-9]+$"
+        imgs = [{"Id": "sha256:abc", "RepoTags": ["ghcr.io/x/y:v1.2.3"]}]
+        with patch.object(ghcr_updater.docker, "inspect_container",
+                          return_value={"Image": "sha256:abc"}), \
+             patch.object(ghcr_updater.docker, "list_images", return_value=imgs) as li:
+            tag = ghcr_updater._get_container_current_tag("c", "x/y", regex, "ghcr.io")
+        li.assert_called_once_with("ghcr.io/x/y")
+        assert tag == "v1.2.3"

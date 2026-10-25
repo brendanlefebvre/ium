@@ -20,7 +20,8 @@ _NTFY_PRIORITIES = {'min', 'low', 'default', 'high', 'urgent'}
 
 
 def _build_payload(image: str, old_version: str, new_version: str,
-                   event: str, digest: str, auto_update: bool) -> Dict[str, Any]:
+                   event: str, digest: str, auto_update: bool,
+                   message: str = '') -> Dict[str, Any]:
     """Return the standard dict passed to every sender."""
     return {
         'event': event,
@@ -29,6 +30,7 @@ def _build_payload(image: str, old_version: str, new_version: str,
         'new_version': new_version,
         'digest': digest,
         'auto_update': auto_update,
+        'message': message,
     }
 
 
@@ -50,7 +52,16 @@ def send_ntfy(cfg: Dict[str, Any], payload: Dict[str, Any]) -> bool:
     old_v = payload['old_version']
     new_v = payload['new_version']
 
-    if event == 'image_rebuilt':
+    tags = 'package'
+    if event == 'resolve_failure':
+        title = f"ium: {image} cannot resolve {new_v}"
+        message = payload.get('message', '')
+        tags = 'warning'
+    elif event == 'resolve_recovered':
+        title = f"ium: {image} resolving again"
+        message = payload.get('message', '')
+        tags = 'white_check_mark'
+    elif event == 'image_rebuilt':
         title = f"ium: {image} rebuilt"
         message = f"{new_v} was rebuilt under the same tag (new digest)."
     else:
@@ -66,7 +77,7 @@ def send_ntfy(cfg: Dict[str, Any], payload: Dict[str, Any]) -> bool:
     headers: Dict[str, str] = {
         'Title': title,
         'Priority': priority,
-        'Tags': 'package',
+        'Tags': tags,
         'Content-Type': 'text/plain',
     }
     for k, v in (cfg.get('headers') or {}).items():
@@ -92,7 +103,8 @@ def send_webhook(cfg: Dict[str, Any], payload: Dict[str, Any]) -> bool:
         headers       (optional) Dict of extra request headers
         body_template (optional) Python string.Template body.
                                  Available variables: $image, $old_version,
-                                 $new_version, $event, $digest, $auto_update.
+                                 $new_version, $event, $digest, $auto_update,
+                                 $message.
                                  If omitted, the raw payload JSON is sent.
     """
     url = (cfg.get('url') or '').strip()
@@ -116,6 +128,7 @@ def send_webhook(cfg: Dict[str, Any], payload: Dict[str, Any]) -> bool:
                 event=payload['event'],
                 digest=payload.get('digest', ''),
                 auto_update=str(payload.get('auto_update', False)).lower(),
+                message=payload.get('message', ''),
             )
         except (KeyError, ValueError) as e:
             logger.warning("webhook: body_template substitution failed: %s — sending raw payload", e)
@@ -137,7 +150,8 @@ def send_webhook(cfg: Dict[str, Any], payload: Dict[str, Any]) -> bool:
 
 def send_notifications(notif_cfg: Optional[Dict[str, Any]],
                        image: str, old_version: str, new_version: str,
-                       event: str, digest: str = '', auto_update: bool = False) -> None:
+                       event: str, digest: str = '', auto_update: bool = False,
+                       message: str = '') -> None:
     """Dispatch notifications to all configured channels.
 
     Safe to call unconditionally — exits immediately when notif_cfg is None
@@ -146,7 +160,8 @@ def send_notifications(notif_cfg: Optional[Dict[str, Any]],
     if not notif_cfg:
         return
 
-    payload = _build_payload(image, old_version, new_version, event, digest, auto_update)
+    payload = _build_payload(image, old_version, new_version, event, digest, auto_update,
+                             message)
 
     ntfy_cfg = notif_cfg.get('ntfy')
     if ntfy_cfg and ntfy_cfg.get('url'):

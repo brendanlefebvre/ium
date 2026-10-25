@@ -76,6 +76,7 @@ class TestRenameFailureRecovery:
         """
         with patch.object(updater, '_get_container_config',
                           return_value=container_info()), \
+             patch.object(updater.docker, 'list_images', return_value=[]), \
              patch.object(updater.docker, 'stop_container'), \
              patch.object(updater.docker, 'rename_container',
                           side_effect=RENAME_TIMED_OUT) as mock_rename, \
@@ -128,6 +129,7 @@ class TestRenameFailureRecovery:
         """The existence probes must only run on the failure path."""
         with patch.object(updater, '_get_container_config',
                           return_value=container_info()), \
+             patch.object(updater.docker, 'list_images', return_value=[]), \
              patch.object(updater.docker, 'stop_container'), \
              patch.object(updater.docker, 'rename_container'), \
              patch.object(updater.docker, 'inspect_container') as mock_inspect, \

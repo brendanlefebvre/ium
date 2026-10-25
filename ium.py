@@ -7,8 +7,9 @@ This script monitors Docker images for updates by comparing a base tag
 tags that match user-defined regex patterns.
 """
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
+import copy
 import json
 import re
 import secrets
@@ -17,15 +18,16 @@ import time
 import logging
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 from pathlib import Path
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 from contextlib import contextmanager
 from enum import Enum
 import argparse
 import os
 import platform
+from urllib.parse import urljoin, urlparse
 import requests
 import jsonschema
 
@@ -63,10 +65,34 @@ DEFAULT_REQUEST_TIMEOUT = 60
 # Registry (HTTPS) request timeout — unrelated to the Docker socket budget above.
 REGISTRY_REQUEST_TIMEOUT = 30
 
+# Upper bound on Link-header pages followed when listing a repository's tags.
+MAX_TAG_PAGES = 50
+
+# A pending (refused) downgrade is notified on first detection, then at most
+# once per this interval; it is re-reported to the UI every cycle regardless.
+DOWNGRADE_RENOTIFY_INTERVAL = timedelta(hours=24)
+
+# Resolver failure escalation (spec §7.4): silent for the first day of a
+# streak, then at most daily through day 7, then at most weekly.
+RESOLVE_FAILURE_FIRST_NOTIFY = timedelta(hours=24)
+RESOLVE_FAILURE_DAILY = timedelta(hours=24)
+RESOLVE_FAILURE_WEEKLY_AFTER = timedelta(days=7)
+RESOLVE_FAILURE_WEEKLY = timedelta(days=7)
+# Digest-mismatch diagnosis gate and sweep size (spec §7.3).
+DIAG_MIN_STREAK = timedelta(hours=2)    # shorter streaks are release races
+DIAG_REFRESH = timedelta(hours=24)      # re-diagnose an unchanged base daily
+DIAG_MOVED_FLOOR = timedelta(hours=6)   # min gap when the base digest moved
+DIAG_MAX_CANDIDATES = 100
+DIAG_MAX_SHARING_TAGS = 5
+
 # Container states that mean "not running", so an update may safely continue
 # after a stop request failed.  'paused' is deliberately excluded: a paused
 # container still holds its processes.
 STOPPED_STATUSES = frozenset({'exited', 'created', 'dead'})
+
+# Docker's container list reports a bare image ID (instead of a name) when the
+# container's original image reference no longer resolves to its image.
+ID_LIKE = re.compile(r'^(sha256:)?[0-9a-f]{12,64}$')
 MANIFEST_ACCEPT_HEADER = (
     "application/vnd.docker.distribution.manifest.list.v2+json,"
     "application/vnd.docker.distribution.manifest.v2+json,"
@@ -80,6 +106,55 @@ class DigestStatus(Enum):
     OK = "ok"
     NOT_FOUND = "not_found"   # registry said 404: the tag does not exist
     ERROR = "error"           # transient/auth/protocol failure: result unknown
+
+
+class ResolveFailure(Enum):
+    """Why ``find_matching_tag`` could not resolve a version (spec §6).
+
+    ``REGEX_STALE`` and ``ROLLING_BASE`` are refined diagnoses of
+    ``NO_DIGEST_MATCH`` (spec §7.3); their values are ``str.format``
+    templates.  The other values contain no braces.
+    """
+    REGISTRY_ERROR = "Transient registry error resolving the base tag; will retry next cycle"
+    NO_TAGS = "Could not list tags from the registry"
+    NO_REGEX_MATCH = "No tags match the regex"
+    NO_DIGEST_MATCH = ("Tags match the regex but none shares the base tag's digest; "
+                       "the base tag may be a rolling build (try a release-line base_tag such as v3) "
+                       "or a release may be mid-publish")
+    NO_FALLBACK_DIGEST = "Base tag does not exist and the newest matching tag could not be read"
+    INTERNAL = "Internal error: regex not found in the compiled-pattern cache; re-save the config or restart ium"
+    REGEX_STALE = "{base_tag} is currently `{tags}`, which the regex `{regex}` does not match"
+    ROLLING_BASE = ("no tag names the current `{base_tag}` digest; it is probably a rolling build. "
+                    "Try a release-line base tag (for example `v3`, `lts`, `stable`)")
+
+
+# diag['outcome'] -> the refined failure it surfaces (spec §7.3).
+_DIAG_REFINEMENTS = {
+    'regex_stale': ResolveFailure.REGEX_STALE,
+    'rolling_base': ResolveFailure.ROLLING_BASE,
+}
+
+
+def _parse_iso(value: Any) -> Optional[datetime]:
+    """Parse an ISO timestamp from state; ``None`` if missing or malformed."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_duration(delta: timedelta) -> str:
+    """Coarse human duration: ``'3d 4h'``, ``'5h 12m'``, ``'7m'``."""
+    total_minutes = max(0, int(delta.total_seconds() // 60))
+    days, rem = divmod(total_minutes, 24 * 60)
+    hours, minutes = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
 
 
 def _natural_sort_key(tag: str) -> tuple:
@@ -277,6 +352,32 @@ class AuthManager:
                 )
 
 
+def _next_link(link_header: Optional[str], base: str) -> Optional[str]:
+    """Return the ``rel="next"`` URL from an RFC 5988 Link header, or None.
+
+    Relative targets (ghcr.io sends ``/v2/...?last=x&n=0``) are resolved
+    against ``base``; the query string is passed through untouched.
+
+    The caller sends the registry bearer token to the returned URL, so a
+    target on a different scheme or host than ``base`` is rejected: None is
+    returned, pagination stops, and the tags fetched so far are still used.
+    """
+    if not link_header:
+        return None
+    for part in link_header.split(','):
+        target, _, params = part.partition(';')
+        target = target.strip()
+        if not (target.startswith('<') and target.endswith('>')):
+            continue
+        if re.search(r'rel\s*=\s*"?next"?(?:[\s;]|$)', params, re.IGNORECASE):
+            resolved = urljoin(base, target[1:-1])
+            base_parts, next_parts = urlparse(base), urlparse(resolved)
+            if (base_parts.scheme, base_parts.netloc) != (next_parts.scheme, next_parts.netloc):
+                return None
+            return resolved
+    return None
+
+
 @dataclass
 class ImageState:
     """State information for a tracked image."""
@@ -284,6 +385,8 @@ class ImageState:
     tag: str
     digest: str
     last_updated: str
+    pending: Optional[Dict[str, Any]] = None
+    resolve_failure: Optional[Dict[str, Any]] = None
 
 
 class DockerImageUpdater:
@@ -312,9 +415,292 @@ class DockerImageUpdater:
         self.compiled_patterns = {}  # Cache for compiled regex patterns
         # Per-registry cache of discovered (realm, service) — None means no auth required.
         self._auth_endpoints: Dict[str, Optional[Tuple[str, str]]] = {}
+        # Set by find_matching_tag: why the last call returned None (None on
+        # success) and the base tag's digest once its HEAD resolved.
+        self._last_resolve_failure: Optional[ResolveFailure] = None
+        self._last_base_digest: Optional[str] = None
         self.config = self._load_config()
         self.state = self._load_state()
         
+    def _now(self) -> datetime:
+        """Current time; a seam so tests can inject a fake clock."""
+        return datetime.now()
+
+    def _downgrade_pending(self, saved_state: Optional['ImageState'],
+                           digest: str) -> Optional[Dict[str, Any]]:
+        """Return the saved downgrade record if it is for this digest, else None.
+
+        Branches on ``reason`` rather than mere presence: a pending record
+        with another reason (e.g. a future ``'cooldown'``) is not ours.
+        """
+        pending = saved_state.pending if saved_state else None
+        if (pending and pending.get('reason') == 'downgrade'
+                and pending.get('digest') == digest):
+            return pending
+        return None
+
+    def _downgrade_notify_due(self, last_notified: Optional[str],
+                              now: datetime) -> bool:
+        """True on first detection or once ``last_notified`` is >= 24 h old."""
+        if not last_notified:
+            return True
+        try:
+            return now - datetime.fromisoformat(last_notified) >= DOWNGRADE_RENOTIFY_INTERVAL
+        except (TypeError, ValueError):
+            # Unparseable timestamp: notify and overwrite it with a good one.
+            return True
+
+    def _write_pending(self, image: str, saved_state: Optional['ImageState'],
+                       base_tag: str, pending: Dict[str, Any], old_tag: str) -> None:
+        """Record ``pending`` without advancing the saved tag/digest.
+
+        With no saved state (first-ever run lands on a downgrade) the
+        placeholder is ``tag=old_tag, digest=''``, so a later non-downgrade
+        candidate takes the normal path because ``'' != digest``.  Only
+        updates ``self.state``; the end-of-cycle ``_save_state`` persists it
+        (and skips the write in dry run).
+        """
+        if saved_state:
+            tag, digest, last_updated = saved_state.tag, saved_state.digest, saved_state.last_updated
+        else:
+            tag, digest, last_updated = old_tag, '', self._now().isoformat()
+        self.state[image] = ImageState(
+            base_tag=base_tag, tag=tag, digest=digest,
+            last_updated=last_updated, pending=pending,
+        )
+
+    def _write_resolve_failure(self, image: str, saved_state: Optional['ImageState'],
+                               base_tag: str, rf: Dict[str, Any]) -> None:
+        """Record the failure streak ``rf`` without touching anything else.
+
+        Preserves the saved tag/digest/last_updated/pending.  An image that
+        has never resolved gets the placeholder ``tag='unknown', digest=''``
+        (spec §7.1), so its first success takes the normal path because
+        ``'' != digest``.  Only updates ``self.state``; the end-of-cycle
+        ``_save_state`` persists it (and skips the write in dry run).
+        """
+        if saved_state:
+            self.state[image] = replace(saved_state, resolve_failure=rf)
+        else:
+            self.state[image] = ImageState(
+                base_tag=base_tag, tag='unknown', digest='',
+                last_updated=self._now().isoformat(), resolve_failure=rf,
+            )
+
+    def _clear_resolve_failure(self, image: str, saved_state: 'ImageState',
+                               matching_tag: str, digest: str,
+                               image_config: Dict[str, Any]) -> None:
+        """End a failure streak: drop the record, log, notify if one was sent.
+
+        Runs on every successful resolve that finds a record, before any of
+        the success path's ``continue``s, and regardless of ``auto_update``
+        or whether the digest changed (spec §7.2).
+        """
+        rf = saved_state.resolve_failure or {}
+        self.state[image] = replace(saved_state, resolve_failure=None)
+        since = _parse_iso(rf.get('since'))
+        duration = _format_duration(self._now() - since) if since else 'an unknown time'
+        self.logger.info(f"RESOLVED AGAIN: {image} after {duration}")
+        if rf.get('last_notified') is not None:
+            send_notifications(
+                self.config.get('notifications'),
+                image=image, old_version=saved_state.tag, new_version=matching_tag,
+                event='resolve_recovered', digest=digest,
+                auto_update=image_config.get('auto_update', False),
+                message=(f"{image} resolves again: {matching_tag} "
+                         f"(after failing for {duration})."),
+            )
+
+    def _effective_failure(self, failure: ResolveFailure, rf: Dict[str, Any],
+                           base_digest: Optional[str]) -> ResolveFailure:
+        """The failure surfaced to the operator this cycle.
+
+        A ``regex_stale`` / ``rolling_base`` finding in ``rf['diag']`` refines
+        ``NO_DIGEST_MATCH`` while it describes the current base digest
+        (spec §7.3, "Which reason is surfaced each cycle"); otherwise the raw
+        failure is surfaced.
+        """
+        diag = rf.get('diag')
+        if (failure is not ResolveFailure.NO_DIGEST_MATCH or not diag
+                or base_digest is None or diag.get('base_digest') != base_digest):
+            return failure
+        return _DIAG_REFINEMENTS.get(diag.get('outcome'), failure)
+
+    def _failure_text(self, failure: ResolveFailure, rf: Dict[str, Any],
+                      base_tag: str, regex: str) -> str:
+        """Operator-facing text for ``failure``; formats the refined templates."""
+        if failure is ResolveFailure.REGEX_STALE:
+            tags = (rf.get('diag') or {}).get('sharing_tags') or []
+            return failure.value.format(tags=', '.join(tags), regex=regex,
+                                        base_tag=base_tag)
+        if failure is ResolveFailure.ROLLING_BASE:
+            return failure.value.format(base_tag=base_tag)
+        return failure.value
+
+    def _should_diagnose(self, rf: Dict[str, Any], base_digest: Optional[str]) -> bool:
+        """The §7.3 gate: a persistent streak with no fresh diagnosis.
+
+        Not a race (>= 2 cycles and >= 2 h), and either never diagnosed, last
+        diagnosed >= 24 h ago, or the base digest moved and the last sweep is
+        >= 6 h old (the floor that stops a rolling base re-sweeping hourly).
+        The caller checks that the raw failure is ``NO_DIGEST_MATCH``.
+        """
+        if base_digest is None:
+            return False
+        now = self._now()
+        since = _parse_iso(rf.get('since'))
+        if since is None or rf.get('cycles', 0) < 2 or now - since < DIAG_MIN_STREAK:
+            return False
+        diag = rf.get('diag')
+        if not diag:
+            return True
+        checked_at = _parse_iso(diag.get('checked_at'))
+        if checked_at is None:
+            return True  # corrupt record: re-diagnose and overwrite it
+        age = now - checked_at
+        if age >= DIAG_REFRESH:
+            return True
+        return diag.get('base_digest') != base_digest and age >= DIAG_MOVED_FLOOR
+
+    def _diagnose_base_tag(self, image: str, base_tag: str, regex: str,
+                           registry: Optional[str], base_digest: str) -> Dict[str, Any]:
+        """Name what ``base_tag`` really is: which tags share its digest (§7.3).
+
+        HEADs up to the last ``DIAG_MAX_CANDIDATES`` tags (Docker Hub in
+        push order, others in list order), excluding ``base_tag``.  Outcome:
+        a sharing tag matches the regex -> ``transient``; sharing tags exist
+        but none matches -> ``regex_stale``; none shares the digest ->
+        ``rolling_base``, unless the evidence is incomplete (no tags listed,
+        or a HEAD failed) -> ``transient``, so a flaky registry never
+        produces a false "rolling build" notification.
+        """
+        reg, namespace, repo = self._parse_image_reference(image)
+        if registry:
+            reg = registry
+        token = self._get_docker_token(reg, namespace, repo)
+        # _get_all_tags_by_date delegates to _get_all_tags off Docker Hub.
+        candidates = [t for t in self._get_all_tags_by_date(reg, namespace, repo)
+                      [-DIAG_MAX_CANDIDATES:] if t != base_tag]
+
+        def fetch_digest(tag: str) -> Tuple[str, Optional[str], DigestStatus]:
+            digest, status = self._get_manifest_digest_head(reg, namespace, repo, tag, token)
+            return (tag, digest, status)
+
+        sharing: List[str] = []
+        head_errors = 0
+        if candidates:
+            with ThreadPoolExecutor(max_workers=min(10, len(candidates))) as executor:
+                futures = [executor.submit(fetch_digest, tag) for tag in candidates]
+                for future in as_completed(futures):
+                    tag, digest, status = future.result()
+                    if status is DigestStatus.OK and digest == base_digest:
+                        sharing.append(tag)
+                    elif status is DigestStatus.ERROR:
+                        head_errors += 1
+
+        pattern = self.compiled_patterns.get(regex)
+        if sharing:
+            matched = pattern is None or any(pattern.match(t) for t in sharing)
+            outcome = 'transient' if matched else 'regex_stale'
+        elif not candidates or head_errors:
+            outcome = 'transient'
+        else:
+            outcome = 'rolling_base'
+        return {
+            'base_digest': base_digest,
+            'checked_at': self._now().isoformat(),
+            'outcome': outcome,
+            'sharing_tags': sorted(sharing)[:DIAG_MAX_SHARING_TAGS],
+        }
+
+    def _maybe_diagnose(self, image: str, base_tag: str, regex: str,
+                        registry: Optional[str], failure: ResolveFailure,
+                        rf: Dict[str, Any], base_digest: Optional[str],
+                        image_config: Dict[str, Any]) -> None:
+        """Run the §7.3 diagnosis sweep when gated in; send A's notification.
+
+        Runs after streak bookkeeping and before the §7.4 escalation; stores
+        ``rf['diag']`` and, on a new ``regex_stale`` / ``rolling_base``
+        finding, sends ``resolve_failure`` at once and sets
+        ``rf['last_notified']`` (so it counts toward B's gap).
+        """
+        if failure is not ResolveFailure.NO_DIGEST_MATCH or base_digest is None:
+            return
+        if not self._should_diagnose(rf, base_digest):
+            return
+        previous = rf.get('diag')
+        diag = self._diagnose_base_tag(image, base_tag, regex, registry, base_digest)
+        rf['diag'] = diag
+        self.logger.info(
+            f"Diagnosed {image}:{base_tag}: {diag['outcome']}"
+            + (f" (shares digest with {', '.join(diag['sharing_tags'])})"
+               if diag['sharing_tags'] else "")
+        )
+        if diag['outcome'] not in ('regex_stale', 'rolling_base'):
+            return
+        if previous and (previous.get('outcome'), previous.get('sharing_tags')) == \
+                (diag['outcome'], diag['sharing_tags']):
+            return
+        shown = self._effective_failure(failure, rf, base_digest)
+        self._send_resolve_failure(image, base_tag, rf,
+                                   self._failure_text(shown, rf, base_tag, regex),
+                                   base_digest, image_config)
+
+    def _escalate_resolve_failure(self, image: str, base_tag: str, rf: Dict[str, Any],
+                                  failure_text: str, image_config: Dict[str, Any]) -> None:
+        """Send ``resolve_failure`` per the §7.4 schedule; sets ``last_notified``.
+
+        Nothing before 24 h of continuous failure, then at most daily until
+        day 7, then at most weekly.
+        """
+        now = self._now()
+        since = _parse_iso(rf.get('since'))
+        if since is None:
+            # Corrupt record: restart the streak clock rather than crash.
+            rf['since'] = now.isoformat()
+            return
+        age = now - since
+        last_notified = _parse_iso(rf.get('last_notified'))
+        gap = (now - last_notified) if last_notified else None  # None: infinite
+
+        if age < RESOLVE_FAILURE_FIRST_NOTIFY:
+            return
+        # Exactly day 7 is still in the daily band, so the week's seventh
+        # reminder lands at 7 d and the first weekly one at 14 d (§7.7).
+        interval = (RESOLVE_FAILURE_DAILY if age <= RESOLVE_FAILURE_WEEKLY_AFTER
+                    else RESOLVE_FAILURE_WEEKLY)
+        if gap is not None and gap < interval:
+            return
+        self._send_resolve_failure(image, base_tag, rf, failure_text,
+                                   self._last_base_digest, image_config)
+
+    def _send_resolve_failure(self, image: str, base_tag: str, rf: Dict[str, Any],
+                              failure_text: str, base_digest: Optional[str],
+                              image_config: Dict[str, Any]) -> None:
+        """Send one ``resolve_failure`` (§7.4 content, §7.5 payload); set ``last_notified``.
+
+        Shared by A's immediate send and B's schedule, so either counts
+        toward the other's gap.
+        """
+        now = self._now()
+        since = _parse_iso(rf.get('since')) or now
+        saved_state = self.state.get(image)
+        current_tag = saved_state.tag if saved_state else 'unknown'
+        sep = '' if failure_text.endswith('.') else '.'
+        message = (
+            f"{image} cannot resolve {base_tag}: {failure_text}{sep} "
+            f"Failing since {since.strftime('%Y-%m-%d %H:%M')} "
+            f"({_format_duration(now - since)}, {rf.get('cycles')} cycles)."
+        )
+        send_notifications(
+            self.config.get('notifications'),
+            image=image, old_version=current_tag, new_version=base_tag,
+            event='resolve_failure', digest=base_digest or '',
+            auto_update=image_config.get('auto_update', False),
+            message=message,
+        )
+        rf['last_notified'] = now.isoformat()
+
     def _setup_logging(self, level: str) -> logging.Logger:
         """Setup logging configuration."""
         logger = logging.getLogger('ium')
@@ -718,9 +1104,20 @@ class DockerImageUpdater:
             headers['Authorization'] = f'Bearer {token}'
 
         try:
-            response = self._request_with_retry('GET', tags_url, headers=headers)
-            response.raise_for_status()
-            return response.json().get('tags') or []
+            tags: List[str] = []
+            url: Optional[str] = tags_url
+            pages = 0
+            while url and pages < MAX_TAG_PAGES:
+                response = self._request_with_retry('GET', url, headers=headers)
+                response.raise_for_status()
+                tags.extend(response.json().get('tags') or [])
+                url = _next_link(response.headers.get('Link'), base=f"https://{registry}")
+                pages += 1
+            if url:
+                self.logger.warning(
+                    f"Tag list for {namespace}/{repo} truncated at {MAX_TAG_PAGES} pages"
+                )
+            return tags
         except requests.RequestException as e:
             self.logger.error(f"Error getting tags for {namespace}/{repo}: {e}")
             return []
@@ -788,6 +1185,10 @@ class DockerImageUpdater:
             The newest-matching-tag fallback fires only when the base tag
             genuinely does not exist (HTTP 404).
         """
+        # Every `return None` below records why (spec §6); success leaves None.
+        self._last_resolve_failure = None
+        self._last_base_digest = None
+
         # Parse image reference
         registry, namespace, repo = self._parse_image_reference(image)
         if registry_override:
@@ -808,7 +1209,10 @@ class DockerImageUpdater:
                 f"Transient registry error resolving {image}:{base_tag}; "
                 f"skipping check this cycle"
             )
+            self._last_resolve_failure = ResolveFailure.REGISTRY_ERROR
             return None
+        if base_status is DigestStatus.OK:
+            self._last_base_digest = base_digest
         if base_status is DigestStatus.NOT_FOUND:
             self.logger.warning(f"Tag '{base_tag}' not found in registry for {image}")
 
@@ -816,12 +1220,14 @@ class DockerImageUpdater:
         all_tags = self._get_all_tags(registry, namespace, repo, token)
         if not all_tags:
             self.logger.error(f"Could not get tags for {image}")
+            self._last_resolve_failure = ResolveFailure.NO_TAGS
             return None
 
         # Get cached compiled pattern
         pattern = self.compiled_patterns.get(regex_pattern)
         if not pattern:
             self.logger.error(f"Pattern not found in cache: '{regex_pattern}'")
+            self._last_resolve_failure = ResolveFailure.INTERNAL
             return None
 
         # Find tags matching the pattern
@@ -830,6 +1236,7 @@ class DockerImageUpdater:
 
         if not matching_tags:
             self.logger.warning(f"No tags matching pattern '{regex_pattern}'")
+            self._last_resolve_failure = ResolveFailure.NO_REGEX_MATCH
             return None
 
         # Newest first.  Natural sort: digit runs compare numerically, so
@@ -868,6 +1275,7 @@ class DockerImageUpdater:
                 f"with {image}:{base_tag} (mid-release race or transient "
                 f"registry errors); skipping check this cycle"
             )
+            self._last_resolve_failure = ResolveFailure.NO_DIGEST_MATCH
             return None
 
         # Base tag genuinely does not exist (true 404, e.g. a repo that
@@ -884,8 +1292,23 @@ class DockerImageUpdater:
             return (latest_tag, latest_digest)
 
         self.logger.error(f"Could not get digest for latest matching tag {image}:{latest_tag}")
+        self._last_resolve_failure = ResolveFailure.NO_FALLBACK_DIGEST
         return None
         
+    def _qualified_image(self, image: str, registry: Optional[str]) -> str:
+        """Prefix *image* with *registry* when the Docker daemon needs it.
+
+        Returns *image* unchanged when no registry is given, the registry is
+        Docker Hub, or the image's first path component already names a host
+        (contains '.' or ':', or is 'localhost').
+        """
+        if not registry or registry == DEFAULT_REGISTRY:
+            return image
+        first = image.split('/')[0]
+        if '.' in first or ':' in first or first == 'localhost':
+            return image
+        return f"{registry}/{image}"
+
     def _pull_image(self, image: str, tag: str,
                     registry: Optional[str] = None) -> bool:
         """
@@ -903,11 +1326,7 @@ class DockerImageUpdater:
             True if successful, False otherwise
         """
         # Qualify image name with registry when the daemon needs it
-        pull_image = image
-        if registry and registry != DEFAULT_REGISTRY:
-            first = image.split('/')[0]
-            if '.' not in first and first != 'localhost' and ':' not in first:
-                pull_image = f"{registry}/{image}"
+        pull_image = self._qualified_image(image, registry)
 
         full_image = f"{pull_image}:{tag}"
 
@@ -958,7 +1377,12 @@ class DockerImageUpdater:
         """Get all containers (running or stopped) using a specific image.
 
         Returns:
-            List of dicts with keys: name, id, state, image_ref
+            List of dicts with keys: name, id, state, image_ref. An empty list
+            means discovery succeeded and no container uses the image.
+
+        Raises:
+            DockerAPIError: the container list could not be fetched; callers
+                must not treat this as "no containers".
         """
         try:
             api_containers = self.docker.list_containers(all=True)
@@ -980,6 +1404,32 @@ class DockerImageUpdater:
                         'image_ref': container_image
                     })
 
+            # Orphaned containers: the list reports a bare image ID, but
+            # inspect still shows the original Config.Image string.
+            for container in api_containers:
+                container_image = container.get('Image', '')
+                if not ID_LIKE.match(container_image):
+                    continue  # already handled by name match
+                names = container.get('Names') or ['/']
+                name = names[0].lstrip('/')
+                # Direct call (not _get_container_config, which swallows
+                # errors): DockerAPIError must propagate.
+                info = self.docker.inspect_container(name)
+                cfg_image = ((info or {}).get('Config') or {}).get('Image', '')
+                if cfg_image and self._image_matches(image, cfg_image):
+                    self.logger.warning(
+                        f"Container {name} runs {image} but its image tag no longer "
+                        f"resolves locally (list reports {container_image[:19]}); "
+                        f"matched via inspect"
+                    )
+                    containers.append({
+                        'name': name,
+                        'id': container.get('Id', ''),
+                        'state': container.get('State', ''),
+                        'image_ref': cfg_image,
+                        'orphaned': True,
+                    })
+
             if not containers and all_images:
                 normalized = self._normalize_image_ref(image)
                 self.logger.debug(
@@ -991,7 +1441,7 @@ class DockerImageUpdater:
 
         except DockerAPIError as e:
             self.logger.error(f"Failed to list containers: {e}")
-            return []
+            raise
 
     @staticmethod
     def _normalize_image_ref(img: str) -> str:
@@ -1048,56 +1498,51 @@ class DockerImageUpdater:
         return (normalized_config == normalized_container or
                 strip_library(normalized_config) == strip_library(normalized_container))
 
-    def _get_container_current_tag(self, container_name: str, image: str, regex: str) -> Optional[str]:
-        """Get the current version tag of a running container by checking image inventory."""
-        try:
-            container_info = self._get_container_config(container_name)
-            if not container_info:
-                self.logger.debug(f"Container {container_name} not found or no config")
-                return None
+    def _get_container_current_tag(self, container_name: str, image: str, regex: str,
+                                   registry: Optional[str] = None) -> Optional[str]:
+        """Return the version tag the container runs, by matching its image ID against the
+        local image inventory.
 
-            # Get the image ID (sha256) from the container
-            image_id = container_info.get('Image', '')
-            if not image_id:
-                self.logger.debug(f"No image ID found for container {container_name}")
-                return None
+        Returns None only when the lookup succeeded but the image carries no tag matching
+        the regex. Raises DockerAPIError if the inspect or image listing fails, so callers
+        can tell "unknown" apart from "daemon unreachable".
+        """
+        container_info = self.docker.inspect_container(container_name)
 
-            # Get cached compiled pattern
-            pattern = self.compiled_patterns.get(regex)
-            if not pattern:
-                self.logger.debug(f"Pattern not found in cache: '{regex}'")
-                return None
-
-            # Query Docker API for images matching this name
-            try:
-                images = self.docker.list_images(image)
-            except DockerAPIError:
-                self.logger.debug(f"Failed to get image tags for {image}")
-                return None
-
-            # Normalize the container's image ID for comparison
-            # image_id from inspect is full sha256:..., API returns Id as sha256:...
-            normalized_id = image_id if image_id.startswith('sha256:') else f"sha256:{image_id}"
-
-            # Find tags that match both the image ID and regex pattern
-            for img in images:
-                if img.get('Id', '') != normalized_id:
-                    continue
-                for repo_tag in img.get('RepoTags') or []:
-                    # RepoTags are "image:tag" format
-                    if ':' in repo_tag:
-                        tag = repo_tag.rsplit(':', 1)[1]
-                    else:
-                        tag = repo_tag
-                    if pattern.match(tag):
-                        self.logger.debug(f"Found matching tag for {container_name}: {tag}")
-                        return tag
-
-            self.logger.debug(f"No matching tag found in image inventory for {container_name}")
+        # Get the image ID (sha256) from the container
+        image_id = container_info.get('Image', '')
+        if not image_id:
+            self.logger.debug(f"No image ID found for container {container_name}")
             return None
-        except Exception as e:
-            self.logger.debug(f"Could not get current tag for {container_name}: {e}")
+
+        # Get cached compiled pattern
+        pattern = self.compiled_patterns.get(regex)
+        if not pattern:
+            self.logger.debug(f"Pattern not found in cache: '{regex}'")
             return None
+
+        # Local tags carry the registry host for non-Docker-Hub images
+        images = self.docker.list_images(self._qualified_image(image, registry))
+
+        # image_id from inspect is full sha256:..., API returns Id as sha256:...
+        normalized_id = image_id if image_id.startswith('sha256:') else f"sha256:{image_id}"
+
+        # Find tags that match both the image ID and regex pattern
+        for img in images or []:
+            if img.get('Id', '') != normalized_id:
+                continue
+            for repo_tag in img.get('RepoTags') or []:
+                # RepoTags are "image:tag" format
+                if ':' in repo_tag:
+                    tag = repo_tag.rsplit(':', 1)[1]
+                else:
+                    tag = repo_tag
+                if pattern.match(tag):
+                    self.logger.debug(f"Found matching tag for {container_name}: {tag}")
+                    return tag
+
+        self.logger.debug(f"No matching tag found in image inventory for {container_name}")
+        return None
 
     def _update_container(self, container_name: str, image: str, tag: str,
                           registry: Optional[str] = None,
@@ -1119,11 +1564,7 @@ class DockerImageUpdater:
         """
         # Apply registry prefix the same way _pull_image does, so the image
         # reference matches what Docker stored when it pulled the image.
-        pull_image = image
-        if registry and registry != DEFAULT_REGISTRY:
-            first = image.split('/')[0]
-            if '.' not in first and first != 'localhost' and ':' not in first:
-                pull_image = f"{registry}/{image}"
+        pull_image = self._qualified_image(image, registry)
         full_image = f"{pull_image}:{tag}"
 
         if self.dry_run:
@@ -1135,12 +1576,27 @@ class DockerImageUpdater:
         if not container_info:
             return False
 
-        # Skip if already running the target image (e.g. retry after partial failure)
-        current_image = container_info.get('Config', {}).get('Image', '')
-        if current_image == full_image:
+        # Skip if already on the target image (e.g. retry after partial failure).
+        # Compare image IDs, not reference strings: after a same-tag re-push
+        # Config.Image still equals full_image while the container sits on the
+        # old image, and a string match would skip the update forever.
+        try:
+            target = self.docker.list_images(full_image)  # reference filter: exact repo:tag
+        except DockerAPIError as e:
+            self.logger.error(
+                f"Could not look up local image {full_image} for "
+                f"{container_name}: {e.message}"
+            )
+            return False
+        target_id = target[0].get('Id', '') if target else ''
+        current_id = container_info.get('Image', '')
+        if target_id and current_id == target_id:
             status = (container_info.get('State') or {}).get('Status', '')
             if status == 'running':
-                self.logger.info(f"Container {container_name} already running {full_image}, skipping")
+                self.logger.info(
+                    f"Container {container_name} already running {full_image} "
+                    f"({target_id[:19]}), skipping"
+                )
                 return True
 
             # On the target image but not running: a previous update was
@@ -1242,39 +1698,77 @@ class DockerImageUpdater:
 
             # Create and start new container
             self.logger.info(f"Creating new container {container_name}...")
+            # Track how far the replacement got: the backup may only be
+            # discarded once the replacement has actually started.
+            new_id: Optional[str] = None
+            started = False
             try:
-                container_id = self.docker.create_container(
+                new_id = self.docker.create_container(
                     container_name, create_config, timeout=request_timeout)
-                self.docker.start_container(container_id, timeout=request_timeout)
+                self.docker.start_container(new_id, timeout=request_timeout)
+                started = True
 
                 # Connect to additional networks
                 for network in extra_networks:
-                    self.docker.connect_network(network, container_id,
+                    self.docker.connect_network(network, new_id,
                                                 timeout=request_timeout)
 
             except DockerAPIError as e:
                 # Rollback on failure
-                self.logger.error(f"Failed to create new container: {e.message}")
+                stage = ('connect networks for' if started
+                         else ('start' if new_id else 'create'))
+                self.logger.error(f"Failed to {stage} new container: {e.message}")
                 self.logger.info("Rolling back...")
+                if new_id and not started:
+                    # The replacement exists under the service name but never
+                    # ran.  Remove it so the backup can take the name back.
+                    try:
+                        self.docker.remove_container(new_id, force=True, timeout=120)
+                    except (DockerAPIError, OSError, TimeoutError) as rm_err:
+                        self.logger.error(
+                            f"Could not remove the failed replacement {new_id[:12]} "
+                            f"({rm_err}); {backup_name} still holds the previous "
+                            f"container — restore it manually"
+                        )
+                        return False
+                renamed_back = False
                 try:
                     self.docker.rename_container(backup_name, container_name,
                                                 timeout=request_timeout)
+                    renamed_back = True
                     self.docker.start_container(container_name,
                                                timeout=request_timeout)
                 except DockerAPIError as rb_err:
-                    # Rename failed — the new container likely took the name already
-                    # (e.g. it was created and started before an extra-network connect
-                    # failed).  Remove the stranded backup instead of leaving it.
-                    self.logger.warning(
-                        f"Rollback rename failed ({rb_err.message}); "
-                        f"removing stranded backup {backup_name}"
-                    )
-                    try:
-                        self.docker.remove_container(backup_name, force=True, timeout=120)
-                    except (DockerAPIError, OSError, TimeoutError) as rm_err:
+                    if renamed_back:
+                        # The previous container is back under its own name
+                        # but would not start (it may share the cause of the
+                        # replacement's failure, e.g. a dead network parent).
+                        self.logger.error(
+                            f"Rollback restored {container_name} but it failed to "
+                            f"start ({rb_err.message}) — fix the cause and start it manually"
+                        )
+                    elif started:
+                        # The replacement started and holds the name (an
+                        # extra-network connect failed after start), so the
+                        # rename back conflicts.  The replacement is running;
+                        # remove the stranded backup instead of leaving it.
                         self.logger.warning(
-                            f"Could not remove backup container {backup_name}: {rm_err} "
-                            f"— remove it manually"
+                            f"Rollback rename failed ({rb_err.message}); "
+                            f"removing stranded backup {backup_name}"
+                        )
+                        try:
+                            self.docker.remove_container(backup_name, force=True, timeout=120)
+                        except (DockerAPIError, OSError, TimeoutError) as rm_err:
+                            self.logger.warning(
+                                f"Could not remove backup container {backup_name}: {rm_err} "
+                                f"— remove it manually"
+                            )
+                    else:
+                        # The replacement never ran: the backup is the only
+                        # working copy and must never be removed here.
+                        self.logger.error(
+                            f"Rollback failed ({rb_err.message}); {backup_name} still holds "
+                            f"the previous container — restore it manually"
                         )
                 return False
 
@@ -1584,34 +2078,97 @@ class DockerImageUpdater:
             
             # Find matching tag for current base tag
             result = self.find_matching_tag(image, base_tag, regex, registry)
+            saved_state = self.state.get(image)
 
             if not result:
-                self.logger.warning(f"Could not determine version for {image}:{base_tag}")
+                # Defensive: every failing branch records a reason, so None
+                # here would be a bug; still say something rather than crash.
+                failure = self._last_resolve_failure or ResolveFailure.INTERNAL
+                base_digest = self._last_base_digest
+
+                # Streak bookkeeping (spec §7.2).  Deep copy (``diag`` is
+                # nested) so the saved record is only replaced via
+                # _write_resolve_failure, never mutated in place.
+                rf = copy.deepcopy((saved_state.resolve_failure if saved_state else None) or {})
+                if not rf:
+                    rf = {'reason': failure.name, 'since': self._now().isoformat(),
+                          'cycles': 0, 'last_notified': None}
+                rf['reason'] = failure.name  # may change mid-streak; `since` does not
+                rf['cycles'] = rf.get('cycles', 0) + 1
+
+                # Diagnosis (spec §7.3): at most one sweep, gated, and only
+                # for NO_DIGEST_MATCH; may send A's notification.
+                self._maybe_diagnose(image, base_tag, regex, registry, failure,
+                                     rf, base_digest, image_config)
+                shown = self._effective_failure(failure, rf, base_digest)
+                shown_text = self._failure_text(shown, rf, base_tag, regex)
+
+                message = f"Could not determine version for {image}:{base_tag}: {shown_text}"
+                self.logger.warning(message)
                 if progress_callback:
-                    progress_callback('check_error', {
+                    payload = {
                         'image': image,
                         'base_tag': base_tag,
-                        'error': f"Could not determine version for {image}:{base_tag} - no matching tags found"
-                    })
+                        'reason': shown.name.lower(),
+                        'error': message,
+                    }
+                    if rf['cycles'] >= 2:
+                        payload['failing_since'] = rf['since']
+                        payload['failing_cycles'] = rf['cycles']
+                    progress_callback('check_error', payload)
+
+                self._escalate_resolve_failure(image, base_tag, rf, shown_text, image_config)
+                # Persist every failing cycle (the counter changes).
+                self._write_resolve_failure(image, saved_state, base_tag, rf)
                 continue
 
             matching_tag, digest = result
             self.logger.info(f"Base tag '{base_tag}' corresponds to: {matching_tag}")
             self.logger.debug(f"Digest: {digest}")
 
+            # A streak ends on any successful resolve, before any of the
+            # `continue`s below and regardless of auto_update or digest.
+            if saved_state and saved_state.resolve_failure:
+                self._clear_resolve_failure(image, saved_state, matching_tag,
+                                            digest, image_config)
+                saved_state = self.state[image]
+
             # Check if this is different from our saved state
-            saved_state = self.state.get(image)
-
-            # Discover all containers using this image
-            containers = self._get_containers_for_image(image)
-
             if not saved_state or saved_state.digest != digest:
-                # Determine current version (from saved state or first container)
-                old_tag = saved_state.tag if saved_state else None
-                if not old_tag and containers:
-                    old_tag = self._get_container_current_tag(containers[0]['name'], image, regex)
-                if not old_tag:
-                    old_tag = 'unknown'
+                # Discover all containers using this image.  Done only when
+                # the registry has moved, so an unchanged image makes no
+                # Docker call.  A list or current-tag lookup failure defers
+                # the image to the next cycle before any pull, notification,
+                # or state write.
+                try:
+                    containers = self._get_containers_for_image(image)
+
+                    # Current version comes from the first container's actual
+                    # image; saved state is used only when no container runs
+                    # this image.  None from the lookup means the container's
+                    # image carries no regex-matching tag (e.g. orphaned).
+                    old_tag = None
+                    if containers:
+                        old_tag = self._get_container_current_tag(
+                            containers[0]['name'], image, regex, registry)
+                        if not old_tag:
+                            old_tag = 'unknown'
+                    elif saved_state:
+                        old_tag = saved_state.tag
+                    if not old_tag:
+                        old_tag = 'unknown'
+                except DockerAPIError as e:
+                    self.logger.warning(
+                        f"Could not list or inspect containers for {image} ({e}); "
+                        f"skipping this cycle so the update is retried"
+                    )
+                    if progress_callback:
+                        progress_callback('check_error', {
+                            'image': image, 'base_tag': base_tag,
+                            'reason': 'docker_unreachable',
+                            'error': f"Docker daemon unreachable while listing or inspecting containers for {image}: {e}",
+                        })
+                    continue
 
                 # Only report update if tags are actually different
                 if old_tag != matching_tag:
@@ -1620,16 +2177,82 @@ class DockerImageUpdater:
                     # of defense against bad candidates (2026-05-24 forgejo
                     # incident); a genuine upstream rollback can still be
                     # applied manually.
+                    # When the container yields no regex-matching tag
+                    # ('unknown', e.g. created from :latest or orphaned), guard
+                    # against the saved tag instead; old_tag stays 'unknown'
+                    # for routing and reporting.
+                    guard_tag = old_tag if old_tag != 'unknown' else (
+                        saved_state.tag if saved_state else None)
                     is_downgrade = (
-                        old_tag not in (None, 'unknown')
-                        and _natural_sort_key(matching_tag) < _natural_sort_key(old_tag)
+                        guard_tag not in (None, 'unknown')
+                        and _natural_sort_key(matching_tag) < _natural_sort_key(guard_tag)
                     )
                     if is_downgrade:
-                        self.logger.warning(
-                            f"DOWNGRADE DETECTED: {image} candidate {matching_tag} "
-                            f"is older than current {old_tag}; reporting but not "
-                            f"auto-applying"
-                        )
+                        # A refused downgrade never advances state: it is
+                        # held as a `pending` record and re-reported every
+                        # cycle until applied, dismissed, or the registry
+                        # moves on.  Falling through to the state-advance
+                        # block below is what handed a refused downgrade to
+                        # the rebuilt path on the next same-tag re-push.
+                        now = self._now()
+                        now_iso = now.isoformat()
+                        existing = self._downgrade_pending(saved_state, digest)
+                        repeat = existing is not None
+                        if existing is not None:
+                            pending = dict(existing)
+                        else:
+                            pending = {
+                                'tag': matching_tag, 'digest': digest,
+                                'first_seen': now_iso, 'reason': 'downgrade',
+                                'dismissed': False, 'last_notified': None,
+                            }
+
+                        if pending.get('dismissed'):
+                            self.logger.debug(
+                                f"Downgrade {image} {old_tag} -> {matching_tag} "
+                                f"dismissed; waiting for registry change"
+                            )
+                            self._write_pending(image, saved_state, base_tag, pending, old_tag)
+                            continue
+
+                        if repeat:
+                            self.logger.info(
+                                f"DOWNGRADE PENDING: {image} {old_tag} -> {matching_tag} "
+                                f"(first seen {pending.get('first_seen')})"
+                            )
+                        else:
+                            self.logger.warning(
+                                f"DOWNGRADE DETECTED: {image} candidate {matching_tag} "
+                                f"is older than current {old_tag}; reporting but not "
+                                f"auto-applying"
+                            )
+
+                        update_info = {
+                            'image': image,
+                            'base_tag': base_tag,
+                            'old_tag': old_tag,
+                            'new_tag': matching_tag,
+                            'digest': digest,
+                            'auto_update': False,
+                            'downgrade': True,
+                            'repeat': repeat,
+                        }
+                        updates_found.append(update_info)
+                        if progress_callback:
+                            progress_callback('update_found', update_info)
+
+                        if self._downgrade_notify_due(pending.get('last_notified'), now):
+                            send_notifications(
+                                self.config.get('notifications'),
+                                image=image, old_version=old_tag, new_version=matching_tag,
+                                event='update_found', digest=digest,
+                                auto_update=False
+                            )
+                            pending['last_notified'] = now_iso
+
+                        self._write_pending(image, saved_state, base_tag, pending, old_tag)
+                        continue  # never reaches the pull / state-advance code below
+
                     effective_auto_update = auto_update and not is_downgrade
 
                     self.logger.info(f"UPDATE AVAILABLE: {old_tag} -> {matching_tag}")
@@ -1761,6 +2384,15 @@ class DockerImageUpdater:
                         )
             else:
                 self.logger.info("No update available")
+                # Upstream reverted the base tag to the saved digest: the
+                # downgrade code never runs on this path, so a refused
+                # downgrade record would otherwise persist forever.
+                if saved_state.pending and saved_state.pending.get('reason') == 'downgrade':
+                    self.logger.info(
+                        f"Clearing pending downgrade for {image} "
+                        f"({saved_state.pending.get('tag')}): registry is back on {matching_tag}"
+                    )
+                    self.state[image] = replace(saved_state, pending=None)
                 # Emit progress: no update
                 if progress_callback:
                     progress_callback('no_update', {

@@ -68,6 +68,7 @@ class TestStopFailureRecovery:
         """
         with patch.object(updater, '_get_container_config',
                           side_effect=[running_info(), post_stop_state]), \
+             patch.object(updater.docker, 'list_images', return_value=[]), \
              patch.object(updater.docker, 'stop_container',
                           side_effect=STOP_TIMED_OUT), \
              patch.object(updater.docker, 'rename_container') as mock_rename, \
@@ -122,6 +123,7 @@ class TestStopFailureRecovery:
         """The extra inspect must only happen on the failure path."""
         with patch.object(updater, '_get_container_config',
                           side_effect=[running_info()]) as mock_inspect, \
+             patch.object(updater.docker, 'list_images', return_value=[]), \
              patch.object(updater.docker, 'stop_container'), \
              patch.object(updater.docker, 'rename_container'), \
              patch.object(updater.docker, 'create_container', return_value='new123'), \

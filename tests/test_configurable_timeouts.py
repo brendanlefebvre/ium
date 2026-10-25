@@ -122,6 +122,7 @@ class TestTimeoutsReachDockerClient:
 
     def test_update_container_applies_both_timeouts(self, updater):
         with patch.object(updater, '_get_container_config', return_value=CONTAINER_INFO), \
+             patch.object(updater.docker, 'list_images', return_value=[]), \
              patch.object(updater.docker, 'stop_container') as mock_stop, \
              patch.object(updater.docker, 'rename_container'), \
              patch.object(updater.docker, 'create_container', return_value='new123') as mock_create, \

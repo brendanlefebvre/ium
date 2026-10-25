@@ -17,6 +17,7 @@ from ium import DEFAULT_REQUEST_TIMEOUT, DockerImageUpdater
 
 TARGET_TAG = "4.0.16.2944-ls299"
 TARGET_IMAGE = f"linuxserver/sonarr:{TARGET_TAG}"
+TARGET_ID = "sha256:" + "a" * 64
 
 
 @pytest.fixture
@@ -35,8 +36,16 @@ def updater(tmp_path):
     return DockerImageUpdater(str(config_file), str(state_file))
 
 
+@pytest.fixture(autouse=True)
+def target_tag_resolves_locally(updater):
+    """The pulled target tag resolves to the image ID the container is on."""
+    with patch.object(updater.docker, "list_images", return_value=[{"Id": TARGET_ID}]):
+        yield
+
+
 def _info(status: str) -> dict:
     return {
+        "Image": TARGET_ID,
         "Config": {"Image": TARGET_IMAGE},
         "State": {"Status": status},
     }
