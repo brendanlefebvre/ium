@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - A downgrade refused by the downgrade guard no longer advances saved state, so a later cycle cannot silently recreate the container on the refused tag
 - Registry tag listing follows `Link` pagination headers (capped at 50 pages); ghcr.io returns only 100 tags per page, which hid newer versions
 - Rollback no longer deletes the backup container when the replacement was created but failed to start; the replacement is removed and the previous container restored instead. Previously a start failure (e.g. a `network_mode: container:<id>` pointing at a recreated container) left the service down with its only working copy removed.
+- Registry tag pagination only follows `Link: rel="next"` targets on the same scheme and host as the tags endpoint, so the bearer token is never sent elsewhere.
 
 ### Added
 - "Ignore until registry changes" action in the Web UI pending list (`POST /api/updates/dismiss`), which silences a pending downgrade in the UI and in notifications until the resolved digest changes

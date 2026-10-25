@@ -27,7 +27,7 @@ from enum import Enum
 import argparse
 import os
 import platform
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 import requests
 import jsonschema
 
@@ -357,6 +357,10 @@ def _next_link(link_header: Optional[str], base: str) -> Optional[str]:
 
     Relative targets (ghcr.io sends ``/v2/...?last=x&n=0``) are resolved
     against ``base``; the query string is passed through untouched.
+
+    The caller sends the registry bearer token to the returned URL, so a
+    target on a different scheme or host than ``base`` is rejected: None is
+    returned, pagination stops, and the tags fetched so far are still used.
     """
     if not link_header:
         return None
@@ -366,7 +370,11 @@ def _next_link(link_header: Optional[str], base: str) -> Optional[str]:
         if not (target.startswith('<') and target.endswith('>')):
             continue
         if re.search(r'rel\s*=\s*"?next"?(?:[\s;]|$)', params, re.IGNORECASE):
-            return urljoin(base, target[1:-1])
+            resolved = urljoin(base, target[1:-1])
+            base_parts, next_parts = urlparse(base), urlparse(resolved)
+            if (base_parts.scheme, base_parts.netloc) != (next_parts.scheme, next_parts.netloc):
+                return None
+            return resolved
     return None
 
 

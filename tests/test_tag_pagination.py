@@ -38,8 +38,14 @@ def test_next_link_relative():
 
 
 def test_next_link_absolute():
-    assert _next_link('<https://other.io/v2/a/tags/list?last=x>; rel="next"', BASE) == \
-        'https://other.io/v2/a/tags/list?last=x'
+    assert _next_link('<https://ghcr.io/v2/a/tags/list?last=x>; rel="next"', BASE) == \
+        'https://ghcr.io/v2/a/tags/list?last=x'
+
+
+def test_next_link_rejects_cross_origin():
+    """The bearer token follows the next link, so it must stay on the same origin."""
+    assert _next_link('<https://other.io/v2/a/tags/list?last=x>; rel="next"', BASE) is None
+    assert _next_link('<http://ghcr.io/v2/a/tags/list?last=x>; rel="next"', BASE) is None
 
 
 def test_next_link_picks_next_among_several():
